@@ -1,12 +1,21 @@
 # Telegram deposit/withdraw bot with admin panel - Cloudflare Python Worker
-# Secrets/vars: BOT_TOKEN, ADMIN_ID. Optional KV binding named SETTINGS (saves admin settings, stats,
-# conversation state, users for broadcast, and each user's saved 1xBet IDs / withdraw accounts).
+# Secrets/vars:
+#   BOT_TOKEN       Telegram bot token
+#   ADMIN_ID        one Telegram user id, or several separated by commas (e.g. 111,222)
+#   WEBHOOK_SECRET  random string (A-Z a-z 0-9 _ -). Telegram must send it back with every update.
+#                   Open  https://<your-worker>/setup?key=<WEBHOOK_SECRET>  once to register the webhook.
+# KV binding named SETTINGS (needed for settings, stats, conversation state, broadcast, saved accounts,
+# request history, duplicate-receipt check, reject reasons, spam limit).
 import asyncio
+import hashlib
+import hmac
 import json
+import random
 import re
 import time
 import traceback
-from html import escape as esc
+from html import escape as esc, unescape
+from urllib.parse import parse_qs, urlparse
 
 import js
 from js import fetch as js_fetch
@@ -25,6 +34,10 @@ SET_MARK = "Admin setting"
 
 MAX_SAVED = 3  # saved 1xBet IDs / withdraw accounts per user
 MAX_TEXT = 1500  # max length of welcome / payment text
+MAX_REQ_HOUR = 5  # requests (deposit + withdraw) one user can send per hour
+HIST_MAX = 10  # requests kept in "My requests"
+REQ_TTL = 90 * 86400  # how long Approve / Reject buttons stay valid
+TXN_TTL = 180 * 86400  # how long a used receipt / withdraw code stays blocked
 
 # short key (used in callback_data) -> label
 METHODS = {"c": "CBE", "t": "Telebirr", "b": "CBE Birr"}
@@ -74,6 +87,13 @@ def card(rows):
 
 def err(text):
     return f"<i>{text}</i>\n\n"
+
+
+def as_json(body):
+    try:
+        return json.loads(body)
+    except Exception:
+        return None
 
 
 # ---------- Rich text: Telegram formatting / Markdown -> Telegram HTML ----------
@@ -173,11 +193,31 @@ def markdown_to_html(text):
     return t
 
 
+def html_ok(h):
+    """True when every tag is closed in the right order (Telegram rejects the message otherwise)."""
+    stack = []
+    for m in re.finditer(r"<(/?)([a-z-]+)[^>]*>", h):
+        if m.group(1):
+            if not stack or stack.pop() != m.group(2):
+                return False
+        else:
+            stack.append(m.group(2))
+    return not stack
+
+
+def plain(h):
+    """Telegram HTML -> plain text (last-resort fallback)."""
+    return unescape(re.sub(r"<[^>]+>", "", h))
+
+
 def to_html(text, entities):
-    """Keep whatever formatting the admin used: Telegram's own, or typed Markdown."""
+    """Keep whatever formatting the admin used: Telegram's own, or typed Markdown.
+    If the result would be broken HTML, fall back to the plain text."""
     if any(e.get("type") in FORMAT_TYPES for e in (entities or [])):
-        return entities_to_html(text, entities)
-    return markdown_to_html(text)
+        out = entities_to_html(text, entities)
+    else:
+        out = markdown_to_html(text)
+    return out if html_ok(out) else esc(text)
 
 
 # ---------- Parsing / validation ----------
@@ -223,11 +263,39 @@ def force_reply(placeholder):
     return {"force_reply": True, "input_field_placeholder": placeholder}
 
 
+def new_rid():
+    return "".join(random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=8))
+
+
+def hkey(prefix, value):
+    return prefix + hashlib.sha256(value.encode()).hexdigest()[:32]
+
+
+def proof_ident(msg):
+    """What identifies a payment proof: a photo / file id, or a normalised transaction ID.
+    None means the message is not a usable proof."""
+    if msg.get("photo"):
+        return "p:" + str(msg["photo"][-1].get("file_unique_id") or new_rid())
+    if msg.get("document"):
+        return "d:" + str(msg["document"].get("file_unique_id") or new_rid())
+    t = re.sub(r"\s+", "", str(msg.get("text") or "")).upper()
+    if len(t) >= 6 and re.search(r"\d", t) and not t.startswith("/"):
+        return "t:" + t
+    return None
+
+
 class Bot:
     def __init__(self, env):
         self.token = env.BOT_TOKEN
-        self.admin_id = getattr(env, "ADMIN_ID", None)
+        raw_admin = getattr(env, "ADMIN_ID", None)
+        self.admins = (
+            [p.strip() for p in str(raw_admin).replace(";", ",").split(",") if p.strip()]
+            if raw_admin else []
+        )
+        self.admin_id = self.admins[0] if self.admins else None
+        self.secret = getattr(env, "WEBHOOK_SECRET", None)
         self.kv = getattr(env, "SETTINGS", None)
+        self.pm = None  # id of the bot message currently on screen (edited in place)
 
     # ---------- Telegram + storage helpers ----------
     async def tg(self, method, payload):
@@ -245,6 +313,17 @@ class Bot:
             print(method, resp.status, body)
         return body
 
+    async def tg_text(self, method, payload):
+        """sendMessage / editMessageText. If Telegram can't parse the HTML, retry as plain text
+        so one bad formatting never makes the bot go silent."""
+        body = await self.tg(method, payload)
+        d = as_json(body)
+        if d and not d.get("ok") and "parse entities" in str(d.get("description", "")).lower():
+            p = {**payload, "text": plain(payload.get("text", ""))}
+            p.pop("parse_mode", None)
+            body = await self.tg(method, p)
+        return body
+
     async def send(self, chat_id, text, markup=None, reply_to=None):
         payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
         if markup:
@@ -252,18 +331,37 @@ class Bot:
         if reply_to:
             payload["reply_to_message_id"] = reply_to
             payload["allow_sending_without_reply"] = True
-        return await self.tg("sendMessage", payload)
+        return await self.tg_text("sendMessage", payload)
 
-    async def edit(self, q, text, markup=None):
-        payload = {
-            "chat_id": q["message"]["chat"]["id"],
-            "message_id": q["message"]["message_id"],
-            "text": text,
-            "parse_mode": "HTML",
-        }
-        if markup:
-            payload["reply_markup"] = markup
-        return await self.tg("editMessageText", payload)
+    async def delete(self, chat_id, mid):
+        if mid:
+            await self.tg("deleteMessage", {"chat_id": chat_id, "message_id": mid})
+
+    async def ui(self, chat_id, text, markup=None):
+        """Show a screen by editing the message already on screen; send a new one only if needed."""
+        if self.pm and not (markup and "force_reply" in markup):
+            payload = {
+                "chat_id": chat_id,
+                "message_id": self.pm,
+                "text": text,
+                "parse_mode": "HTML",
+                "reply_markup": markup if markup else {"inline_keyboard": []},
+            }
+            d = as_json(await self.tg_text("editMessageText", payload))
+            if d and (d.get("ok") or "not modified" in str(d.get("description", "")).lower()):
+                return
+        elif self.pm:
+            # a reply prompt can't be made by editing, so drop the old message and send a fresh one
+            await self.delete(chat_id, self.pm)
+        d = as_json(await self.send(chat_id, text, markup))
+        self.pm = ((d or {}).get("result") or {}).get("message_id")
+
+    async def step(self, chat_id, text, markup, st):
+        """Show a screen and remember which step (and which message) we're on."""
+        await self.ui(chat_id, text, markup)
+        if self.pm:
+            st = {**st, "pm": self.pm}
+        await self.set_state(chat_id, st)
 
     async def answer(self, q, text=None, alert=False):
         payload = {"callback_query_id": q["id"]}
@@ -286,11 +384,24 @@ class Bot:
             print("KV read error", traceback.format_exc())
         return default
 
-    async def kv_set(self, key, value):
+    async def kv_exists(self, key):
         if self.kv is None:
             return False
         try:
-            await self.kv.put(key, json.dumps(value))
+            return isinstance(await self.kv.get(key), str)
+        except Exception:
+            print("KV read error", traceback.format_exc())
+            return False
+
+    async def kv_set(self, key, value, ttl=None):
+        if self.kv is None:
+            return False
+        try:
+            if ttl:
+                opts = to_js({"expirationTtl": int(ttl)}, dict_converter=js.Object.fromEntries)
+                await self.kv.put(key, json.dumps(value), opts)
+            else:
+                await self.kv.put(key, json.dumps(value))
             return True
         except Exception:
             print("KV write error", traceback.format_exc())
@@ -300,7 +411,7 @@ class Bot:
         return await self.kv_get("settings", dict(DEFAULTS))
 
     def is_admin(self, uid):
-        return bool(self.admin_id) and str(uid) == str(self.admin_id)
+        return str(uid) in self.admins
 
     # ---------- Conversation state (so users can just type) ----------
     async def get_state(self, cid):
@@ -323,11 +434,18 @@ class Bot:
         except Exception:
             print("state write error", traceback.format_exc())
 
-    async def clear_state(self, cid):
+    async def clear_state(self, cid, notify=True):
+        """Drop the saved step. If an admin was about to give a reject reason and walks away,
+        the user still gets the rejection (without a reason)."""
         if self.kv is None:
             return
         try:
+            raw = await self.kv.get(f"state:{cid}")
             await self.kv.delete(f"state:{cid}")
+            if notify and isinstance(raw, str):
+                st = json.loads(raw)
+                if st.get("step") == "reason":
+                    await self.notify_decision(st["uid"], st["kind"], st["amount"], False, None)
         except Exception:
             print("state delete error", traceback.format_exc())
 
@@ -423,8 +541,10 @@ class Bot:
             {"text": "Deposit", "callback_data": "deposit"},
             {"text": "Withdraw", "callback_data": "withdraw"},
         ]]
+        row2 = [{"text": "My requests", "callback_data": "hist"}]
         if s.get("support"):
-            rows.append([{"text": "Support", "url": f"https://t.me/{s['support']}"}])
+            row2.append({"text": "Support", "url": f"https://t.me/{s['support']}"})
+        rows.append(row2)
         if admin:
             rows.append([{"text": "Admin panel", "callback_data": "adm:home"}])
         return {"inline_keyboard": rows}
@@ -436,11 +556,13 @@ class Bot:
     async def menu(self, chat_id, uid=None):
         s = await self.settings()
         text, markup = self.menu_view(s, uid)
-        await self.send(chat_id, text, markup)
+        await self.ui(chat_id, text, markup)
 
     # ---------- Admin panel ----------
-    def panel_view(self, s):
+    def panel_view(self, s, note=""):
         warn = "" if self.kv is not None else err("Storage not connected. Settings can't be saved.")
+        if not self.secret:
+            warn += err("WEBHOOK_SECRET is not set. Anyone can send fake updates to this bot.")
         support = f"@{esc(s['support'])}" if s["support"] else "not set"
         rows = [
             ("Deposits", "<b>On</b>" if s["dep_on"] else "<b>Off</b>"),
@@ -449,7 +571,7 @@ class Bot:
             ("Withdraw limits", f"{fmt(s['min_wit'])} – {fmt(s['max_wit'])} ETB"),
             ("Support", support),
         ]
-        text = f"<b>Admin panel</b>\n\n{warn}{card(rows)}\n\nTap an option to change it."
+        text = f"<b>Admin panel</b>\n\n{note}{warn}{card(rows)}\n\nTap an option to change it."
         markup = {"inline_keyboard": [
             [
                 {"text": f"Deposits: {'On' if s['dep_on'] else 'Off'}", "callback_data": "adm:tdep"},
@@ -478,7 +600,7 @@ class Bot:
 
     async def send_panel(self, chat_id):
         text, markup = self.panel_view(await self.settings())
-        await self.send(chat_id, text, markup)
+        await self.ui(chat_id, text, markup)
 
     async def stats_view(self):
         st = await self.kv_get("stats", dict(STATS0))
@@ -536,10 +658,11 @@ class Bot:
         saved = await self.kv_set("settings", s)
         await self.clear_state(chat_id)
         if saved:
-            await self.send(chat_id, f"<b>Saved</b> · {esc(label)}")
+            note = f"<b>Saved</b> · {esc(label)}\n\n"
         else:
-            await self.send(chat_id, "Couldn't save. Connect a KV namespace named <code>SETTINGS</code> first.")
-        await self.send_panel(chat_id)
+            note = err("Couldn't save. Connect a KV namespace named <code>SETTINGS</code> first.")
+        text_out, markup = self.panel_view(s, note)
+        await self.ui(chat_id, text_out, markup)
 
     async def ask_setting(self, chat_id, key, error=False):
         label, kind = SETTING_INFO[key]
@@ -560,22 +683,23 @@ class Bot:
             f"<b>{esc(label)}</b>\nSend {hint}.\n{extra}\n"
             f"{self.how_to()}{ref}"
         )
-        await self.set_state(chat_id, {"step": "set", "key": key})
-        await self.send(chat_id, text, self.prompt_markup(label[:60]))
+        await self.step(chat_id, text, self.prompt_markup(label[:60]), {"step": "set", "key": key})
 
     # ---------- Broadcast (admin) ----------
     async def ask_broadcast(self, chat_id):
         if self.kv is None:
-            return await self.send(
-                chat_id, "Broadcast needs storage. Connect a KV namespace named <code>SETTINGS</code> first."
+            return await self.ui(
+                chat_id,
+                "Broadcast needs storage. Connect a KV namespace named <code>SETTINGS</code> first.",
+                {"inline_keyboard": [[{"text": "Back", "callback_data": "adm:home"}]]},
             )
-        await self.set_state(chat_id, {"step": "bc"})
-        await self.send(
+        await self.step(
             chat_id,
             "<b>Broadcast</b>\n\n"
             "Send the message everyone should receive. Text, photo, video or any file works, "
             "and your formatting is kept.\n\nType it below.",
             self.prompt_markup("Message to broadcast"),
+            {"step": "bc"},
         )
 
     async def on_broadcast_msg(self, msg):
@@ -583,7 +707,13 @@ class Bot:
         users = await self.list_users()
         if not users:
             await self.clear_state(chat_id)
-            return await self.send(chat_id, "No users registered yet.")
+            return await self.ui(
+                chat_id, "No users registered yet.",
+                {"inline_keyboard": [[{"text": "Back", "callback_data": "adm:home"}]]},
+            )
+        # the admin's message stays (it's what gets copied); replace the old prompt with a confirm
+        await self.delete(chat_id, self.pm)
+        self.pm = None
         await self.set_state(chat_id, {"step": "bc_confirm", "mid": msg["message_id"]})
         markup = {"inline_keyboard": [
             [{"text": f"Send to {len(users)} users", "callback_data": "bc:go"}],
@@ -601,9 +731,8 @@ class Bot:
             body = await self.tg("copyMessage", {
                 "chat_id": int(uid), "from_chat_id": from_chat, "message_id": mid,
             })
-            try:
-                d = json.loads(body)
-            except Exception:
+            d = as_json(body)
+            if d is None:
                 return "fail"
             if d.get("ok"):
                 return "ok"
@@ -630,7 +759,7 @@ class Bot:
             for r in results:
                 counts[r] += 1
             await asyncio.sleep(0.7)  # stay under Telegram's ~30 msg/sec limit
-        await self.send(
+        await self.ui(
             admin_chat,
             "<b>Broadcast finished</b>\n\n"
             + card([
@@ -638,11 +767,14 @@ class Bot:
                 ("Blocked the bot", counts["blocked"]),
                 ("Failed", counts["fail"]),
             ]),
+            {"inline_keyboard": [[{"text": "Back to panel", "callback_data": "adm:home"}]]},
         )
 
     # ---------- Admin notification ----------
-    async def send_to_admin(self, msg, kind, amount, account=None, xid=None, code=None, method=None):
-        user = msg["from"]
+    async def send_to_admin(self, user, kind, amount, proof=None, account=None, xid=None,
+                            code=None, method=None, tk=None):
+        """Notify every admin. Returns the request id carried by the Approve / Reject buttons."""
+        rid = new_rid()
         title = "New deposit request" if kind == "d" else "New withdraw request"
         rows = [
             ("User", esc(user_label(user))),
@@ -658,16 +790,119 @@ class Bot:
         if account:
             rows.append(("Account", f"<code>{esc(account)}</code>"))
         markup = {"inline_keyboard": [[
-            {"text": "Approve", "callback_data": f"ok:{kind}:{user['id']}:{amount}"},
-            {"text": "Reject", "callback_data": f"no:{kind}:{user['id']}:{amount}"},
+            {"text": "Approve", "callback_data": f"ok:{kind}:{user['id']}:{amount}:{rid}"},
+            {"text": "Reject", "callback_data": f"no:{kind}:{user['id']}:{amount}:{rid}"},
         ]]}
-        if kind == "d":
-            await self.tg("copyMessage", {
-                "chat_id": self.admin_id,
-                "from_chat_id": msg["chat"]["id"],
-                "message_id": msg["message_id"],
-            })
-        await self.send(self.admin_id, f"<b>{title}</b>\n\n{card(rows)}", markup)
+        msgs = []
+        for aid in self.admins:
+            if kind == "d" and proof:
+                await self.tg("copyMessage", {
+                    "chat_id": aid,
+                    "from_chat_id": proof["chat"]["id"],
+                    "message_id": proof["message_id"],
+                })
+            d = as_json(await self.send(aid, f"<b>{title}</b>\n\n{card(rows)}", markup))
+            mid = ((d or {}).get("result") or {}).get("message_id")
+            if mid:
+                msgs.append([aid, mid])
+        # the record lets us ignore a second tap and update every admin's copy
+        await self.kv_set(
+            f"req:{rid}",
+            {"k": kind, "u": user["id"], "a": amount, "m": msgs, "tk": tk, "s": "p"},
+            REQ_TTL,
+        )
+        return rid
+
+    async def notify_decision(self, user_id, kind, amount, approved, reason):
+        what = "Deposit" if kind == "d" else "Withdrawal"
+        if approved:
+            title, note = f"{what} approved", "Thank you."
+        else:
+            title = f"{what} rejected"
+            note = f"<b>Reason</b>\n<blockquote>{esc(reason)}</blockquote>\n\n" if reason else ""
+            note += "Please contact support if you have questions."
+        s = await self.settings()
+        await self.send(
+            user_id,
+            f"<b>{title}</b>\n\n{card([('Amount', f'<b>{fmt(amount)} ETB</b>')])}\n\n{note}",
+            self.menu_markup(s, self.is_admin(user_id)),
+        )
+
+    async def finish_reject(self, chat_id, st, reason):
+        """Admin gave a reason (or skipped): tell the user."""
+        back = {"inline_keyboard": [[{"text": "Admin panel", "callback_data": "adm:home"}]]}
+        if st.get("step") != "reason":
+            return await self.ui(chat_id, "Nothing to send.", back)
+        await self.clear_state(chat_id, notify=False)
+        await self.notify_decision(st["uid"], st["kind"], st["amount"], False, reason)
+        await self.ui(chat_id, "<b>Rejected</b>\n\nThe user was notified.", back)
+
+    # ---------- Spam limit ----------
+    async def rate_ok(self, uid):
+        if self.kv is None or self.is_admin(uid):
+            return True
+        d = await self.kv_get(f"rl:{uid}", {"n": 0, "t": 0})
+        if int(time.time()) - int(d.get("t", 0)) >= 3600:
+            return True
+        return int(d.get("n", 0)) < MAX_REQ_HOUR
+
+    async def rate_hit(self, uid):
+        if self.kv is None or self.is_admin(uid):
+            return
+        now = int(time.time())
+        d = await self.kv_get(f"rl:{uid}", {"n": 0, "t": 0})
+        if now - int(d.get("t", 0)) >= 3600:
+            d = {"n": 1, "t": now}
+        else:
+            d["n"] = int(d.get("n", 0)) + 1
+        await self.kv_set(f"rl:{uid}", d, max(60, 3600 - (now - int(d["t"]))))
+
+    # ---------- Request history ("My requests") ----------
+    async def hist_add(self, uid, rid, kind, amount):
+        if self.kv is None:
+            return
+        items = await self._saved(f"hist:{uid}")
+        items.append({"r": rid, "k": kind, "a": amount, "s": "p", "t": int(time.time())})
+        await self.kv_set(f"hist:{uid}", items[-HIST_MAX:])
+
+    async def hist_update(self, uid, rid, status):
+        if self.kv is None or not rid:
+            return
+        items = await self._saved(f"hist:{uid}")
+        for it in items:
+            if isinstance(it, dict) and it.get("r") == rid:
+                it["s"] = status
+        await self.kv_set(f"hist:{uid}", items)
+
+    def hist_view(self, items):
+        names = {"p": "Pending", "a": "Approved", "r": "Rejected"}
+        items = [i for i in items if isinstance(i, dict) and i.get("k") in ("d", "w")]
+        if not items:
+            body = "You have no requests yet."
+        else:
+            rows = []
+            for it in reversed(items):
+                what = "Deposit" if it["k"] == "d" else "Withdrawal"
+                day = time.strftime("%d %b", time.gmtime(int(it.get("t", 0)) + 3 * 3600))  # Ethiopia, UTC+3
+                rows.append((day, f"{what} {fmt(it['a'])} ETB · {names.get(it.get('s'), '')}"))
+            body = card(rows)
+        markup = {"inline_keyboard": [[{"text": "Main menu", "callback_data": "menu"}]]}
+        return f"<b>Your requests</b>\n\n{body}", markup
+
+    def help_view(self, uid):
+        lines = [
+            "<b>Help</b>\n",
+            "<b>Deposit</b> · send the amount, your 1xBet ID, then your payment proof.",
+            "<b>Withdraw</b> · send your withdraw code, the amount, then where to receive the money.",
+            "<b>My requests</b> · your latest requests and their status.\n",
+            "/start · main menu",
+            "/history · your requests",
+            "/help · this message",
+        ]
+        if self.is_admin(uid):
+            lines.append("/admin · admin panel")
+        markup = {"inline_keyboard": [[{"text": "Main menu", "callback_data": "menu"}]]}
+        return "\n".join(lines), markup
 
     # ---------- Deposit flow: amount -> 1xBet ID (type or tap saved) -> proof ----------
     async def ask_amount(self, chat_id, s, error=False):
@@ -678,14 +913,13 @@ class Bot:
             f"Enter the amount in <b>ETB</b>.\n<i>Min {fmt(lo)} · Max {fmt(hi)}</i>\n\n"
             f"{self.how_to()}"
         )
-        await self.set_state(chat_id, {"step": "dep1"})
-        await self.send(chat_id, text, self.prompt_markup("Amount in ETB"))
+        await self.step(chat_id, text, self.prompt_markup("Amount in ETB"), {"step": "dep1"})
 
     async def on_amount(self, chat_id, text):
         s = await self.settings()
         if not s["dep_on"]:
             await self.clear_state(chat_id)
-            return await self.send(chat_id, "Deposits are temporarily unavailable. Please try again later.")
+            return await self.ui(chat_id, "Deposits are temporarily unavailable. Please try again later.")
         amount = parse_amount(text)
         if amount is None or amount < s["min_dep"] or amount > s["max_dep"]:
             return await self.ask_amount(chat_id, s, error=True)
@@ -710,27 +944,29 @@ class Bot:
             f"{card([('Amount', f'<b>{fmt(amount)} ETB</b>')])}\n\n"
             f"{ask}\n{self.how_to()}"
         )
-        await self.set_state(chat_id, {"step": "dep2", "amount": str(amount)})
-        await self.send(chat_id, text, markup)
+        await self.step(chat_id, text, markup, {"step": "dep2", "amount": str(amount)})
 
-    async def show_pay_step(self, chat_id, amount, xid, s):
+    async def show_pay_step(self, chat_id, amount, xid, s, error=None):
         pay = s["pay_info"]  # already Telegram HTML
         pay_block = pay if "<blockquote" in pay else f"<blockquote>{pay}</blockquote>"
+        note = err(error) if error else ""
         body = (
-            f"{head(DEP3)}\n\n"
+            f"{head(DEP3)}\n\n{note}"
             f"{card([('Amount', f'<b>{fmt(amount)} ETB</b>'), ('1xBet ID', f'<code>{xid}</code>')])}\n\n"
             f"<b>Pay to</b>\n{pay_block}\n\n"
             "After paying, send a <b>screenshot</b> or the <b>transaction ID</b>.\n"
             f"{self.how_to()}"
         )
-        await self.set_state(chat_id, {"step": "dep3", "amount": str(amount), "xid": xid})
-        await self.send(chat_id, body, self.prompt_markup("Screenshot or transaction ID"))
+        await self.step(
+            chat_id, body, self.prompt_markup("Screenshot or transaction ID"),
+            {"step": "dep3", "amount": str(amount), "xid": xid},
+        )
 
     async def on_xbet(self, chat_id, amount, text):
         s = await self.settings()
         if not s["dep_on"]:
             await self.clear_state(chat_id)
-            return await self.send(chat_id, "Deposits are temporarily unavailable. Please try again later.")
+            return await self.ui(chat_id, "Deposits are temporarily unavailable. Please try again later.")
         xid = parse_xbet_id(text)
         if not xid:
             return await self.ask_xbet(chat_id, amount, error=True)
@@ -742,18 +978,45 @@ class Bot:
         s = await self.settings()
         if not s["dep_on"]:
             await self.clear_state(chat_id)
-            return await self.send(chat_id, "Deposits are temporarily unavailable. Please try again later.")
-        if not self.admin_id:
+            return await self.ui(chat_id, "Deposits are temporarily unavailable. Please try again later.")
+        if not self.admins:
             print("ADMIN_ID is not set")
-            return await self.send(chat_id, "Service unavailable. Please try again later.")
+            return await self.ui(chat_id, "Service unavailable. Please try again later.")
         if not xid:
             return await self.ask_xbet(chat_id, amount)  # safety net
+        if not await self.rate_ok(uid):
+            await self.clear_state(chat_id)
+            return await self.ui(
+                chat_id, "Too many requests. Please try again later.",
+                self.menu_markup(s, self.is_admin(uid)),
+            )
 
-        await self.send_to_admin(msg, "d", amount, xid=xid)
+        # the proof must be a screenshot / file, or a transaction ID that looks real
+        ident = proof_ident(msg)
+        if not ident:
+            return await self.show_pay_step(
+                chat_id, amount, xid, s, error="Send a screenshot or a valid transaction ID.",
+            )
+        tk = None
+        if self.kv is not None:
+            tk = hkey("txn:", ident)
+            if await self.kv_exists(tk):
+                return await self.show_pay_step(
+                    chat_id, amount, xid, s, error="This receipt was already used. Send a different one.",
+                )
+
+        rid = await self.send_to_admin(msg["from"], "d", amount, proof=msg, xid=xid, tk=tk)
+        if tk:
+            await self.kv_set(tk, 1, TXN_TTL)
         await self.record_xid(chat_id, xid)
+        await self.hist_add(uid, rid, "d", amount)
+        await self.rate_hit(uid)
         await self.bump("dep_req")
         await self.clear_state(chat_id)
-        await self.send(
+        # the user's proof stays in the chat, so remove the old prompt and confirm below it
+        await self.delete(chat_id, self.pm)
+        self.pm = None
+        await self.ui(
             chat_id,
             "<b>Request sent</b>\n\n"
             f"{card([('Deposit', f'<b>{fmt(amount)} ETB</b>'), ('1xBet ID', f'<code>{esc(xid)}</code>')])}\n\n"
@@ -763,22 +1026,23 @@ class Bot:
 
     # ---------- Withdraw flow: code -> amount -> method / saved account -> account ----------
     async def ask_wit_code(self, chat_id, error=False):
-        note = err("Invalid code. Use letters and numbers only (3–20 characters).") if error else ""
+        note = err(error) if isinstance(error, str) else err("Invalid code. Use letters and numbers only (3–20 characters).") if error else ""
         text = (
             f"{head(WIT1)}\n\n{note}"
             f"Send your <b>withdraw code</b>.\n{self.how_to()}"
         )
-        await self.set_state(chat_id, {"step": "wit1"})
-        await self.send(chat_id, text, self.prompt_markup("Withdraw code"))
+        await self.step(chat_id, text, self.prompt_markup("Withdraw code"), {"step": "wit1"})
 
     async def on_wit_code(self, chat_id, text):
         s = await self.settings()
         if not s["wit_on"]:
             await self.clear_state(chat_id)
-            return await self.send(chat_id, "Withdrawals are temporarily unavailable. Please try again later.")
+            return await self.ui(chat_id, "Withdrawals are temporarily unavailable. Please try again later.")
         code = parse_wit_code(text)
         if not code:
             return await self.ask_wit_code(chat_id, error=True)
+        if await self.kv_exists(hkey("wc:", code.upper())):
+            return await self.ask_wit_code(chat_id, error="This withdraw code was already used.")
         await self.ask_wit_amount(chat_id, code, s)
 
     async def ask_wit_amount(self, chat_id, code, s, error=False):
@@ -790,14 +1054,13 @@ class Bot:
             f"Enter the amount in <b>ETB</b>.\n<i>Min {fmt(lo)} · Max {fmt(hi)}</i>\n\n"
             f"{self.how_to()}"
         )
-        await self.set_state(chat_id, {"step": "wit2", "code": code})
-        await self.send(chat_id, text, self.prompt_markup("Amount in ETB"))
+        await self.step(chat_id, text, self.prompt_markup("Amount in ETB"), {"step": "wit2", "code": code})
 
     async def on_wit_amount(self, chat_id, code, text):
         s = await self.settings()
         if not s["wit_on"]:
             await self.clear_state(chat_id)
-            return await self.send(chat_id, "Withdrawals are temporarily unavailable. Please try again later.")
+            return await self.ui(chat_id, "Withdrawals are temporarily unavailable. Please try again later.")
         amount = parse_amount(text)
         if amount is None or amount < s["min_wit"] or amount > s["max_wit"]:
             return await self.ask_wit_amount(chat_id, code, s, error=True)
@@ -829,8 +1092,10 @@ class Bot:
             f"{card([('Withdraw code', esc(code)), ('Amount', f'<b>{fmt(amount)} ETB</b>')])}\n\n"
             f"{hint}"
         )
-        await self.set_state(chat_id, {"step": "wit3", "amount": str(amount), "code": code})
-        await self.send(chat_id, text, {"inline_keyboard": rows})
+        await self.step(
+            chat_id, text, {"inline_keyboard": rows},
+            {"step": "wit3", "amount": str(amount), "code": code},
+        )
 
     async def ask_wit_account(self, chat_id, amount, code, mkey, error=False):
         if mkey == "c":
@@ -843,29 +1108,45 @@ class Bot:
             f"{card([('Withdraw code', esc(code)), ('Amount', f'<b>{fmt(amount)} ETB</b>'), ('Method', METHODS[mkey])])}\n\n"
             f"Send your <b>{hint}</b>.\n{self.how_to()}"
         )
-        await self.set_state(
-            chat_id, {"step": "wit4", "amount": str(amount), "code": code, "method": mkey}
+        await self.step(
+            chat_id, text, self.prompt_markup(ph),
+            {"step": "wit4", "amount": str(amount), "code": code, "method": mkey},
         )
-        await self.send(chat_id, text, self.prompt_markup(ph))
 
     async def submit_withdraw(self, user, chat_id, amount, code, mkey, account):
         """Final step, shared by typed accounts and saved-account buttons."""
         s = await self.settings()
         if not s["wit_on"]:
             await self.clear_state(chat_id)
-            return await self.send(chat_id, "Withdrawals are temporarily unavailable. Please try again later.")
-        if not self.admin_id:
+            return await self.ui(chat_id, "Withdrawals are temporarily unavailable. Please try again later.")
+        if not self.admins:
             print("ADMIN_ID is not set")
-            return await self.send(chat_id, "Service unavailable. Please try again later.")
+            return await self.ui(chat_id, "Service unavailable. Please try again later.")
+        if not await self.rate_ok(user["id"]):
+            await self.clear_state(chat_id)
+            return await self.ui(
+                chat_id, "Too many requests. Please try again later.",
+                self.menu_markup(s, self.is_admin(user["id"])),
+            )
+        tk = hkey("wc:", code.upper()) if self.kv is not None else None
+        if tk and await self.kv_exists(tk):
+            await self.clear_state(chat_id)
+            return await self.ui(
+                chat_id, "This withdraw code was already used.",
+                self.menu_markup(s, self.is_admin(user["id"])),
+            )
 
-        fake_msg = {"from": user, "chat": {"id": chat_id}}
-        await self.send_to_admin(
-            fake_msg, "w", amount, account=account, code=code, method=METHODS[mkey]
+        rid = await self.send_to_admin(
+            user, "w", amount, account=account, code=code, method=METHODS[mkey], tk=tk
         )
+        if tk:
+            await self.kv_set(tk, 1, TXN_TTL)
         await self.record_account(chat_id, mkey, account)
+        await self.hist_add(user["id"], rid, "w", amount)
+        await self.rate_hit(user["id"])
         await self.bump("wit_req")
         await self.clear_state(chat_id)
-        await self.send(
+        await self.ui(
             chat_id,
             "<b>Request sent</b>\n\n"
             f"{card([('Withdrawal', f'<b>{fmt(amount)} ETB</b>'), (METHODS[mkey], f'<code>{esc(account)}</code>')])}\n\n"
@@ -889,17 +1170,41 @@ class Bot:
         text = msg.get("text") or ""
         reply = (msg.get("reply_to_message") or {}).get("text") or ""
 
-        if text.startswith("/start"):
+        state = await self.get_state(chat_id) or {}
+        step = state.get("step")
+        self.pm = state.get("pm")
+
+        if text.startswith("/start") or text.startswith("/admin"):
+            # start fresh: drop any old prompt and the command itself
+            await self.delete(chat_id, self.pm)
+            if self.kv is not None:
+                await self.delete(chat_id, msg["message_id"])
+            self.pm = None
             await self.clear_state(chat_id)
-            return await self.menu(chat_id, uid)
-        if text.startswith("/admin"):
-            await self.clear_state(chat_id)
-            if self.is_admin(uid):
+            if text.startswith("/admin") and self.is_admin(uid):
                 return await self.send_panel(chat_id)
             return await self.menu(chat_id, uid)
 
-        state = await self.get_state(chat_id) or {}
-        step = state.get("step")
+        if text.startswith("/help") or text.startswith("/history"):
+            await self.delete(chat_id, self.pm)
+            if self.kv is not None:
+                await self.delete(chat_id, msg["message_id"])
+            self.pm = None
+            await self.clear_state(chat_id)
+            if text.startswith("/help"):
+                out, markup = self.help_view(uid)
+            else:
+                out, markup = self.hist_view(await self._saved(f"hist:{uid}"))
+            return await self.ui(chat_id, out, markup)
+
+        # Admin is typing the reason for a rejection
+        if step == "reason" and self.is_admin(uid):
+            if self.kv is not None:
+                await self.delete(chat_id, msg["message_id"])
+            reason = text.strip()[:300]
+            if not reason:
+                return
+            return await self.finish_reject(chat_id, state, reason)
 
         # Admin is composing a broadcast: any message type is accepted
         if step == "bc" and self.is_admin(uid):
@@ -932,6 +1237,10 @@ class Bot:
                         "method": LABEL_TO_KEY[mm.group(1)],
                     }
 
+        # Keep the chat tidy: remove typed answers (the payment proof stays)
+        if self.kv is not None and step in ("set", "dep1", "dep2", "wit1", "wit2", "wit3", "wit4"):
+            await self.delete(chat_id, msg["message_id"])
+
         if step == "set" and self.is_admin(uid):
             return await self.save_setting(chat_id, state.get("key"), text, msg.get("entities"))
         if step == "dep1":
@@ -957,12 +1266,15 @@ class Bot:
         data = q.get("data") or ""
         uid = q["from"]["id"]
         chat_id = q["message"]["chat"]["id"]
+        self.pm = q["message"]["message_id"]  # the message the user tapped is the one we edit
 
         if data in ("deposit", "withdraw"):
             is_dep = data == "deposit"
             s = await self.settings()
             if not s["dep_on" if is_dep else "wit_on"]:
                 return await self.answer(q, "Temporarily unavailable. Please try again later.", True)
+            if not await self.rate_ok(uid):
+                return await self.answer(q, "Too many requests. Please try again later.", True)
             await self.answer(q)
             if is_dep:
                 return await self.ask_amount(chat_id, s)
@@ -983,11 +1295,6 @@ class Bot:
             if amt < s["min_dep"] or amt > s["max_dep"]:
                 return await self.answer(q, "Amount is outside the allowed limits.", True)
             await self.answer(q)
-            await self.tg("editMessageReplyMarkup", {
-                "chat_id": chat_id,
-                "message_id": q["message"]["message_id"],
-                "reply_markup": {"inline_keyboard": []},
-            })
             return await self.show_pay_step(chat_id, amt, xid, s)
 
         # New withdraw account: user picked CBE / Telebirr / CBE Birr
@@ -1019,7 +1326,7 @@ class Bot:
             if amt < s["min_wit"] or amt > s["max_wit"]:
                 return await self.answer(q, "Amount is outside the allowed limits.", True)
             await self.answer(q)
-            # remove the buttons so it can't be sent twice
+            # remove the buttons first so a double tap can't send it twice
             await self.tg("editMessageReplyMarkup", {
                 "chat_id": chat_id,
                 "message_id": q["message"]["message_id"],
@@ -1036,39 +1343,77 @@ class Bot:
                 return await self.answer(q, "This broadcast has expired.", True)
             await self.clear_state(chat_id)  # clear first so a retried update can't send it twice
             await self.answer(q)
-            await self.edit(q, "<b>Broadcast</b>\n\nSending…")
+            await self.ui(chat_id, "<b>Broadcast</b>\n\nSending…")
             return await self.run_broadcast(chat_id, state["mid"])
 
         if data in ("menu", "cancel"):
             await self.answer(q)
             await self.clear_state(chat_id)
             text, markup = self.menu_view(await self.settings(), uid)
-            return await self.edit(q, text, markup)
+            return await self.ui(chat_id, text, markup)
+
+        if data == "hist":
+            await self.answer(q)
+            out, markup = self.hist_view(await self._saved(f"hist:{uid}"))
+            return await self.ui(chat_id, out, markup)
+
+        # Admin skipped the rejection reason
+        if data == "rs:skip":
+            if not self.is_admin(uid):
+                return await self.answer(q, "Admins only", True)
+            await self.answer(q)
+            return await self.finish_reject(chat_id, await self.get_state(chat_id) or {}, None)
 
         if data.startswith(("ok:", "no:")):
             if not self.is_admin(uid):
                 return await self.answer(q, "Not allowed", True)
-            await self.answer(q)
-            action, kind, user_id, amount = data.split(":")
+            parts = data.split(":")
+            if len(parts) < 4 or parts[1] not in ("d", "w"):
+                return await self.answer(q)
+            action, kind, user_id, amount = parts[:4]
+            rid = parts[4] if len(parts) > 4 else None
             approved = action == "ok"
-            what = "Deposit" if kind == "d" else "Withdrawal"
+            rec = None
+            if rid and self.kv is not None:
+                rec = await self.kv_get(f"req:{rid}", None)
+                if not isinstance(rec, dict):
+                    return await self.answer(q, "This request has expired.", True)
+                if rec.get("s") != "p":  # another tap or another admin got there first
+                    done = "approved" if rec.get("s") == "a" else "rejected"
+                    return await self.answer(q, f"Already {done}.", True)
+                rec["s"] = "a" if approved else "r"
+                await self.kv_set(f"req:{rid}", rec, REQ_TTL)
+            await self.answer(q)
+
+            who = q["from"].get("first_name") or "admin"
+            label = f"{'Approved' if approved else 'Rejected'} by {who}"[:60]
+            targets = rec["m"] if rec and rec.get("m") else [[chat_id, q["message"]["message_id"]]]
+            for c, m in targets:  # every admin's copy shows the result
+                await self.tg("editMessageReplyMarkup", {
+                    "chat_id": c,
+                    "message_id": m,
+                    "reply_markup": {"inline_keyboard": [[{"text": label, "callback_data": "noop"}]]},
+                })
             await self.bump(f"{'dep' if kind == 'd' else 'wit'}_{'ok' if approved else 'no'}")
-            await self.tg("editMessageReplyMarkup", {
-                "chat_id": chat_id,
-                "message_id": q["message"]["message_id"],
-                "reply_markup": {"inline_keyboard": [[
-                    {"text": "Approved" if approved else "Rejected", "callback_data": "noop"}
-                ]]},
-            })
+            await self.hist_update(user_id, rid, "a" if approved else "r")
+
             if approved:
-                note = "Thank you."
-                title = f"{what} approved"
-            else:
-                note = "Please contact support if you have questions."
-                title = f"{what} rejected"
-            return await self.send(
-                user_id,
-                f"<b>{title}</b>\n\n{card([('Amount', f'<b>{fmt(amount)} ETB</b>')])}\n\n{note}",
+                return await self.notify_decision(user_id, kind, amount, True, None)
+
+            if rec and rec.get("tk"):  # a rejected receipt / code may be used again
+                try:
+                    await self.kv.delete(rec["tk"])
+                except Exception:
+                    print("txn delete error", traceback.format_exc())
+            if self.kv is None:  # no storage = can't wait for a reason
+                return await self.notify_decision(user_id, kind, amount, False, None)
+            await self.clear_state(chat_id)  # an unfinished earlier reason is sent without text
+            self.pm = None  # new message, the request card above stays as it is
+            return await self.step(
+                chat_id,
+                "<b>Reject reason</b>\n\nSend a short reason for the user, or tap Skip.\n\nType it below.",
+                {"inline_keyboard": [[{"text": "Skip", "callback_data": "rs:skip"}]]},
+                {"step": "reason", "uid": user_id, "kind": kind, "amount": amount},
             )
 
         if data.startswith("adm:"):
@@ -1091,17 +1436,47 @@ class Bot:
                 return await self.ask_setting(chat_id, parts[2])
             if parts[1] == "stats":
                 text, markup = await self.stats_view()
-                return await self.edit(q, text, markup)
+                return await self.ui(chat_id, text, markup)
             text, markup = self.panel_view(s)
-            return await self.edit(q, text, markup)
+            return await self.ui(chat_id, text, markup)
 
         await self.answer(q)
 
 
 class Default(WorkerEntrypoint):
+    async def setup(self, request):
+        """GET /setup?key=<WEBHOOK_SECRET> registers the webhook (with the secret) and the command list."""
+        url = urlparse(str(request.url))
+        if url.path.rstrip("/") != "/setup":
+            return Response("OK")
+        secret = getattr(self.env, "WEBHOOK_SECRET", None)
+        key = (parse_qs(url.query).get("key") or [""])[0]
+        if not secret or not hmac.compare_digest(key.encode(), str(secret).encode()):
+            return Response("Forbidden", status=403)
+        bot = Bot(self.env)
+        hook = await bot.tg("setWebhook", {
+            "url": f"{url.scheme}://{url.netloc}/",
+            "secret_token": str(secret),
+            "allowed_updates": ["message", "callback_query"],
+        })
+        cmds = await bot.tg("setMyCommands", {"commands": [
+            {"command": "start", "description": "Main menu"},
+            {"command": "history", "description": "My requests"},
+            {"command": "help", "description": "How it works"},
+        ]})
+        return Response(f"setWebhook: {hook}\nsetMyCommands: {cmds}")
+
     async def fetch(self, request):
+        if request.method == "GET":
+            return await self.setup(request)
         if request.method != "POST":
             return Response("OK")
+        # only Telegram knows the secret, so fake updates are refused
+        secret = getattr(self.env, "WEBHOOK_SECRET", None)
+        if secret:
+            got = request.headers.get("X-Telegram-Bot-Api-Secret-Token") or ""
+            if not hmac.compare_digest(str(got).encode(), str(secret).encode()):
+                return Response("Forbidden", status=403)
         try:
             update = await request.json()
             bot = Bot(self.env)
