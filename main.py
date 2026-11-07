@@ -12,8 +12,9 @@ from workers import WorkerEntrypoint, Response
 
 LINE = "━━━━━━━━━━━━━━━━"
 
-DEP1 = "DEPOSIT · Step 1 of 2"
-DEP2 = "DEPOSIT · Step 2 of 2"
+DEP1 = "DEPOSIT · Step 1 of 3"
+DEP2 = "DEPOSIT · Step 2 of 3"
+DEP3 = "DEPOSIT · Step 3 of 3"
 WIT1 = "WITHDRAW · Step 1 of 2"
 WIT2 = "WITHDRAW · Step 2 of 2"
 SET_MARK = "ADMIN SETTING"
@@ -57,6 +58,11 @@ def parse_amount(text):
         n = round(n, 2)
         return int(n) if n == int(n) else n
     return None
+
+
+def parse_xbet_id(text):
+    t = str(text or "").strip().replace(" ", "")
+    return t if re.fullmatch(r"\d{5,15}", t) else None
 
 
 def user_label(u):
@@ -321,7 +327,7 @@ class Bot:
         await self.send(chat_id, text, self.prompt_markup(label[:60]))
 
     # ---------- Requests ----------
-    async def send_to_admin(self, msg, kind, amount, account=None):
+    async def send_to_admin(self, msg, kind, amount, account=None, xid=None):
         user = msg["from"]
         title = "📥 NEW DEPOSIT REQUEST" if kind == "d" else "📤 NEW WITHDRAW REQUEST"
         lines = [
@@ -329,8 +335,10 @@ class Bot:
             LINE,
             f"👤 <b>User:</b> {esc(user_label(user))}",
             f"🆔 <b>ID:</b> <code>{user['id']}</code>",
-            f"💵 <b>Amount:</b> {fmt(amount)} ETB",
         ]
+        if xid:
+            lines.append(f"🎮 <b>1xBet ID:</b> <code>{esc(xid)}</code>")
+        lines.append(f"💵 <b>Amount:</b> {fmt(amount)} ETB")
         if account:
             lines.append(f"🏦 <b>Account:</b> <code>{esc(account)}</code>")
         markup = {"inline_keyboard": [[
@@ -355,26 +363,47 @@ class Bot:
         if amount is None or amount < lo or amount > hi:
             return await self.ask_amount(chat_id, is_dep, s, error=True)
         if is_dep:
-            body = (
-                f"<b>💰 {DEP2}</b>\n{LINE}\n"
-                f"💵 <b>Amount:</b> {fmt(amount)} ETB\n\n"
-                f"🏦 <b>Pay to:</b>\n{esc(s['pay_info'])}\n\n"
-                "After paying, send your <b>screenshot</b> or <b>transaction ID</b>.\n"
-                f"{self.how_to()}"
-            )
-            hint = "Screenshot or transaction ID"
-        else:
-            body = (
-                f"<b>💸 {WIT2}</b>\n{LINE}\n"
-                f"💵 <b>Amount:</b> {fmt(amount)} ETB\n\n"
-                "Send the <b>account / phone number</b> where you want to receive your money.\n"
-                f"{self.how_to()}"
-            )
-            hint = "Account or phone number"
-        await self.set_state(chat_id, {"step": "dep2" if is_dep else "wit2", "amount": str(amount)})
-        await self.send(chat_id, body, self.prompt_markup(hint))
+            return await self.ask_xbet(chat_id, amount)
+        body = (
+            f"<b>💸 {WIT2}</b>\n{LINE}\n"
+            f"💵 <b>Amount:</b> {fmt(amount)} ETB\n\n"
+            "Send the <b>account / phone number</b> where you want to receive your money.\n"
+            f"{self.how_to()}"
+        )
+        await self.set_state(chat_id, {"step": "wit2", "amount": str(amount)})
+        await self.send(chat_id, body, self.prompt_markup("Account or phone number"))
 
-    async def on_proof(self, msg, is_dep, amount, text):
+    async def ask_xbet(self, chat_id, amount, error=False):
+        note = "⚠️ Invalid 1xBet ID. Send numbers only.\n\n" if error else ""
+        text = (
+            f"<b>💰 {DEP2}</b>\n{LINE}\n{note}"
+            f"💵 <b>Amount:</b> {fmt(amount)} ETB\n\n"
+            "Send your <b>1xBet ID</b> (the account to be credited).\n"
+            f"{self.how_to()}"
+        )
+        await self.set_state(chat_id, {"step": "dep2", "amount": str(amount)})
+        await self.send(chat_id, text, self.prompt_markup("Your 1xBet ID"))
+
+    async def on_xbet(self, chat_id, amount, text):
+        s = await self.settings()
+        if not s["dep_on"]:
+            await self.clear_state(chat_id)
+            return await self.send(chat_id, "⛔ Temporarily unavailable. Please try again later.")
+        xid = parse_xbet_id(text)
+        if not xid:
+            return await self.ask_xbet(chat_id, amount, error=True)
+        body = (
+            f"<b>💰 {DEP3}</b>\n{LINE}\n"
+            f"💵 <b>Amount:</b> {fmt(amount)} ETB\n"
+            f"🎮 <b>1xBet ID:</b> {xid}\n\n"
+            f"🏦 <b>Pay to:</b>\n{esc(s['pay_info'])}\n\n"
+            "After paying, send your <b>screenshot</b> or <b>transaction ID</b>.\n"
+            f"{self.how_to()}"
+        )
+        await self.set_state(chat_id, {"step": "dep3", "amount": str(amount), "xid": xid})
+        await self.send(chat_id, body, self.prompt_markup("Screenshot or transaction ID"))
+
+    async def on_proof(self, msg, is_dep, amount, text, xid=None):
         chat_id = msg["chat"]["id"]
         uid = msg["from"]["id"]
         s = await self.settings()
@@ -384,6 +413,8 @@ class Bot:
         if not self.admin_id:
             print("ADMIN_ID is not set")
             return await self.send(chat_id, "⚠️ Service unavailable. Please try again later.")
+        if is_dep and not xid:
+            return await self.ask_xbet(chat_id, amount)  # safety net
         if not is_dep and not text.strip():
             return await self.send(
                 chat_id,
@@ -391,14 +422,17 @@ class Bot:
                 self.prompt_markup("Account or phone number"),
             )
 
-        await self.send_to_admin(msg, "d" if is_dep else "w", amount, None if is_dep else text.strip())
+        await self.send_to_admin(
+            msg, "d" if is_dep else "w", amount, None if is_dep else text.strip(), xid
+        )
         await self.bump("dep_req" if is_dep else "wit_req")
         await self.clear_state(chat_id)
         what = "deposit" if is_dep else "withdrawal"
+        extra = f"\n🎮 <b>1xBet ID:</b> {esc(xid)}" if xid else ""
         await self.send(
             chat_id,
             f"<b>📨 REQUEST SENT</b>\n{LINE}\n"
-            f"Your {what} request for <b>{fmt(amount)} ETB</b> is with the admin.\n"
+            f"Your {what} request for <b>{fmt(amount)} ETB</b> is with the admin.{extra}\n"
             "You'll be notified here once it's reviewed ⏳",
             self.menu_markup(s, self.is_admin(uid)),
         )
@@ -430,18 +464,24 @@ class Bot:
                 step = "dep1"
             elif WIT1 in reply:
                 step = "wit1"
-            elif DEP2 in reply or WIT2 in reply:
-                m = re.search(r"Amount: ([\d,.]+) ETB", reply)
-                if m:
-                    step = "dep2" if DEP2 in reply else "wit2"
-                    state = {"amount": m.group(1).replace(",", "")}
+            else:
+                am = re.search(r"Amount: ([\d,.]+) ETB", reply)
+                xm = re.search(r"1xBet ID: (\d+)", reply)
+                if am and DEP2 in reply:
+                    step, state = "dep2", {"amount": am.group(1).replace(",", "")}
+                elif am and xm and DEP3 in reply:
+                    step, state = "dep3", {"amount": am.group(1).replace(",", ""), "xid": xm.group(1)}
+                elif am and WIT2 in reply:
+                    step, state = "wit2", {"amount": am.group(1).replace(",", "")}
 
         if step == "set" and self.is_admin(uid):
             return await self.save_setting(chat_id, state.get("key"), text)
         if step in ("dep1", "wit1"):
             return await self.on_amount(chat_id, step == "dep1", text)
-        if step in ("dep2", "wit2") and state.get("amount"):
-            return await self.on_proof(msg, step == "dep2", state["amount"], text)
+        if step == "dep2" and state.get("amount"):
+            return await self.on_xbet(chat_id, state["amount"], text)
+        if step in ("dep3", "wit2") and state.get("amount"):
+            return await self.on_proof(msg, step == "dep3", state["amount"], text, state.get("xid"))
 
         await self.menu(chat_id, uid)
 
