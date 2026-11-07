@@ -5,7 +5,9 @@
 #   WEBHOOK_SECRET  random string (A-Z a-z 0-9 _ -). Telegram must send it back with every update.
 #                   Open  https://<your-worker>/setup?key=<WEBHOOK_SECRET>  once to register the webhook.
 # KV binding named SETTINGS (needed for settings, stats, conversation state, broadcast, saved accounts,
-# request history, duplicate-receipt check, reject reasons, spam limit).
+# request history, duplicate-receipt check, reject reasons, spam limit, one-open-request lock, bans).
+# Keys: settings, stats, bans (one key for all banned users), user:<id> (ONE record per user: rate limit,
+# open request, saved IDs / accounts, history), state:<chat>, req:<id>, txn:<hash> / wc:<hash> (used receipts / codes).
 import asyncio
 import hashlib
 import hmac
@@ -37,7 +39,13 @@ MAX_REQ_HOUR = 5  # requests (deposit + withdraw) one user can send per hour
 HIST_MAX = 10  # requests kept in "My requests"
 REQ_TTL = 90 * 86400  # how long Approve / Reject buttons stay valid
 TXN_TTL = 180 * 86400  # how long a used receipt / withdraw code stays blocked
-DEBUG_PROOF = True  # step-by-step "LOG ·" messages about screenshots, sent to the first admin only. False = off
+PEND_TTL = 86400  # one open request per user; the lock frees itself after this long if no admin answers
+BAN_SHOW = 20  # banned users listed (with Unban buttons) on the Bans screen
+OPEN_MSG = "You already have a request waiting for the admin. Please wait for the reply before sending another."
+BAN_MSG = "You are not allowed to use this bot."
+CACHE_TTL = 30  # seconds settings and the ban list are kept in memory (a change by an admin reaches every instance within this time)
+_CACHE = {}  # name -> (valid until, value). Lives as long as the running instance and is shared by all updates it handles
+_SEEN = set()  # users this instance has already registered, so they are not looked up again
 
 # short key (used in callback_data) -> label
 METHODS = {"c": "CBE", "t": "Telebirr", "b": "CBE Birr"}
@@ -312,6 +320,11 @@ class Bot:
         self.secret = getattr(env, "WEBHOOK_SECRET", None)
         self.kv = getattr(env, "SETTINGS", None)
         self.pm = None  # id of the bot message currently on screen (edited in place)
+        # read once per update, then reused (one Bot object handles exactly one update)
+        self._u = {}  # user id -> record
+        self._fresh = set()  # records that were not stored yet (new user / old layout)
+        self._ro = set()  # records we could not read: never written back, so nothing is overwritten
+        self._state = {}  # chat id -> state as stored (None = known to be empty)
 
     # ---------- Telegram + storage helpers ----------
     async def tg(self, method, payload):
@@ -328,15 +341,6 @@ class Bot:
         if resp.status != 200:
             print(method, resp.status, body)
         return body
-
-    async def dbg(self, text):
-        """Debug line for the first admin only (never the user). Plain text, never raises."""
-        if not DEBUG_PROOF or not self.admins:
-            return
-        try:
-            await self.tg("sendMessage", {"chat_id": self.admins[0], "text": ("LOG · " + text)[:900]})
-        except Exception:
-            print("dbg error", traceback.format_exc())
 
     async def tg_text(self, method, payload):
         """sendMessage / editMessageText. If Telegram can't parse the HTML, retry as plain text
@@ -433,7 +437,27 @@ class Bot:
             return False
 
     async def settings(self):
-        return await self.kv_get("settings", dict(DEFAULTS))
+        """Almost every update needs the settings and they rarely change, so they are kept in memory."""
+        hit = _CACHE.get("settings")
+        if hit and hit[0] > time.time():
+            return dict(hit[1])
+        if self.kv is None:
+            return dict(DEFAULTS)
+        try:
+            raw = await self.kv.get("settings")
+            stored = json.loads(raw) if isinstance(raw, str) else {}
+        except Exception:
+            print("settings read error", traceback.format_exc())
+            return dict(DEFAULTS)  # a failed read is not remembered
+        s = {**DEFAULTS, **stored} if isinstance(stored, dict) else dict(DEFAULTS)
+        _CACHE["settings"] = (time.time() + CACHE_TTL, s)
+        return dict(s)
+
+    async def save_settings(self, s):
+        ok = await self.kv_set("settings", s)
+        if ok:
+            _CACHE["settings"] = (time.time() + CACHE_TTL, dict(s))  # this instance sees it at once
+        return ok
 
     def is_admin(self, uid):
         return str(uid) in self.admins
@@ -442,20 +466,28 @@ class Bot:
     async def get_state(self, cid):
         if self.kv is None:
             return None
+        k = str(cid)
+        if k in self._state:  # already read in this update
+            return self._state[k]
         try:
             raw = await self.kv.get(f"state:{cid}")
-            if isinstance(raw, str):
-                return json.loads(raw)
+            st = json.loads(raw) if isinstance(raw, str) else None
         except Exception:
             print("state read error", traceback.format_exc())
-        return None
+            return None
+        self._state[k] = st
+        return st
 
     async def set_state(self, cid, st):
         if self.kv is None:
             return
+        k = str(cid)
+        if k in self._state and self._state[k] == st:
+            return  # same step again (e.g. after a wrong answer): nothing new to write
         try:
             opts = to_js({"expirationTtl": 3600}, dict_converter=js.Object.fromEntries)
             await self.kv.put(f"state:{cid}", json.dumps(st), opts)
+            self._state[k] = st
         except Exception:
             print("state write error", traceback.format_exc())
 
@@ -464,16 +496,26 @@ class Bot:
         the user still gets the rejection (without a reason)."""
         if self.kv is None:
             return
+        k = str(cid)
         try:
-            raw = await self.kv.get(f"state:{cid}")
+            if k in self._state:
+                st = self._state[k]
+                if not st:
+                    return  # known to be empty: nothing to delete
+            elif self.is_admin(cid):
+                raw = await self.kv.get(f"state:{cid}")  # only admins can be in the "reject reason" step
+                st = json.loads(raw) if isinstance(raw, str) else None
+                if not st:
+                    self._state[k] = None
+                    return
+            else:
+                st = None  # a normal user has nothing that needs reading first
             await self.kv.delete(f"state:{cid}")
-            if notify and isinstance(raw, str):
-                st = json.loads(raw)
-                if st.get("step") == "reason":
-                    await self.notify_decision(st["uid"], st["kind"], st["ref"], False, None)
+            self._state[k] = None
+            if notify and st and st.get("step") == "reason":
+                await self.notify_decision(st["uid"], st["kind"], st["ref"], False, None)
         except Exception:
             print("state delete error", traceback.format_exc())
-
     def prompt_markup(self, placeholder):
         # With storage the bot remembers the step, so no "reply" is needed.
         if self.kv is not None:
@@ -485,28 +527,42 @@ class Bot:
 
     # ---------- Users (for broadcast) ----------
     async def touch(self, uid):
-        """Remember every user who talks to the bot."""
-        if self.kv is None or not uid:
+        """Remember every user who talks to the bot (their record is what the broadcast list is made of).
+        A user this instance has already registered costs nothing."""
+        uid = str(uid)
+        if self.kv is None or not uid or uid in _SEEN:
             return
-        try:
-            raw = await self.kv.get(f"user:{uid}")
-            if not isinstance(raw, str):
-                await self.kv.put(f"user:{uid}", "1")
-        except Exception:
-            print("touch error", traceback.format_exc())
-
+        await self.urec(uid)
+        if uid in self._ro:
+            return
+        if uid in self._fresh:
+            await self.usave(uid)
+            if uid in self._fresh:  # could not be saved: try again next time
+                return
+        if len(_SEEN) > 50000:
+            _SEEN.clear()
+        _SEEN.add(uid)
     async def list_users(self):
+        """Everyone who talked to the bot, except banned users."""
+        ids = await self._list_ids("user:")
+        if not ids:
+            return ids
+        bans = await self.bans()
+        return [i for i in ids if i not in bans]
+
+    async def _list_ids(self, prefix):
+        """Ids of every KV key that starts with prefix (e.g. 'user:' -> user ids)."""
         ids, cursor = [], None
         if self.kv is None:
             return ids
         try:
             while True:
-                opts = {"prefix": "user:", "limit": 1000}
+                opts = {"prefix": prefix, "limit": 1000}
                 if cursor:
                     opts["cursor"] = cursor
                 res = await self.kv.list(to_js(opts, dict_converter=js.Object.fromEntries))
                 data = json.loads(js.JSON.stringify(res))
-                ids += [k["name"][5:] for k in data.get("keys", [])]
+                ids += [k["name"][len(prefix):] for k in data.get("keys", [])]
                 if data.get("list_complete") or not data.get("cursor"):
                     break
                 cursor = data["cursor"]
@@ -514,20 +570,61 @@ class Bot:
             print("list users error", traceback.format_exc())
         return ids
 
-    # ---------- Saved items (max 3 per user): withdraw accounts + 1xBet IDs ----------
+    # ---------- One record per user (user:<id>) ----------
+    # Rate limit, open request, saved 1xBet IDs / withdraw accounts (max 3 each) and request history all live
+    # in this one key: one read and one write per update instead of one per item.
     async def _saved(self, key):
         items = await self.kv_get(key, [])
         return items if isinstance(items, list) else []
 
+    async def urec(self, uid):
+        """The user's record, read once per update and kept in memory. Change it, then call usave()."""
+        uid = str(uid)
+        rec = self._u.get(uid)
+        if rec is not None:
+            return rec
+        rec = {"v": 1, "x": [], "a": [], "h": []}
+        self._u[uid] = rec
+        if self.kv is None:
+            return rec
+        try:
+            raw = await self.kv.get(f"user:{uid}")
+            data = json.loads(raw) if isinstance(raw, str) else None
+        except Exception:
+            print("user read error", traceback.format_exc())
+            self._ro.add(uid)  # content unknown: usable for this update, but never written over the real one
+            return rec
+        if isinstance(data, dict) and data.get("v") == 1:
+            self._u[uid] = rec = data
+            return rec
+        self._fresh.add(uid)
+        if data is not None:  # registered by an older version, which kept these in separate keys
+            rec["x"], rec["a"], rec["h"] = await asyncio.gather(
+                *[self._saved(f"{p}:{uid}") for p in ("xids", "accts", "hist")]
+            )
+        return rec
+
+    async def usave(self, uid):
+        uid = str(uid)
+        if self.kv is None or uid in self._ro or uid not in self._u:
+            return
+        if await self.kv_set(f"user:{uid}", self._u[uid]):
+            self._fresh.discard(uid)
+
     async def get_accounts(self, uid):
-        items = await self._saved(f"accts:{uid}")
+        items = (await self.urec(uid)).get("a") or []
         return [a for a in items if isinstance(a, dict) and a.get("m") in METHODS and a.get("a")][:MAX_SAVED]
 
     async def get_xids(self, uid):
-        items = await self._saved(f"xids:{uid}")
+        items = (await self.urec(uid)).get("x") or []
         return [a for a in items if isinstance(a, dict) and a.get("a")][:MAX_SAVED]
 
-    async def _record(self, key, items, new, same):
+    async def get_hist(self, uid):
+        items = (await self.urec(uid)).get("h")
+        return items if isinstance(items, list) else []
+
+    @staticmethod
+    def _remember(items, new, same):
         """Known item -> use count +1. New item -> added, or replaces the least-used one
         (oldest use breaks a tie) when MAX_SAVED are already stored."""
         now = int(time.time())
@@ -543,23 +640,28 @@ class Bot:
             else:
                 victim = min(range(len(items)), key=lambda i: (items[i].get("n", 0), items[i].get("t", 0)))
                 items[victim] = new
-        await self.kv_set(key, items)
+        return items
 
-    async def record_account(self, uid, mkey, account):
-        if self.kv is None:
-            return
-        items = await self.get_accounts(uid)
-        await self._record(
-            f"accts:{uid}", items, {"m": mkey, "a": account},
-            lambda a: a["m"] == mkey and a["a"] == account,
-        )
-
-    async def record_xid(self, uid, xid):
-        if self.kv is None:
-            return
-        items = await self.get_xids(uid)
-        await self._record(f"xids:{uid}", items, {"a": xid}, lambda a: a["a"] == xid)
-
+    async def note_request(self, uid, rid, kind, ref, delivered, xid=None, account=None):
+        """A request went to the admin. Spam counter, open-request lock, saved ID / account and history
+        are all updated in the user's record and stored with ONE write."""
+        rec = await self.urec(uid)
+        now = int(time.time())
+        if not self.is_admin(uid):
+            n, t = rec.get("rl") or [0, 0]
+            rec["rl"] = [1, now] if now - int(t) >= 3600 else [int(n) + 1, int(t)]
+            if delivered:  # no lock if no admin got the card, or the user could not try again
+                rec["p"] = [rid, now]
+        if xid:
+            rec["x"] = self._remember(await self.get_xids(uid), {"a": xid}, lambda a: a["a"] == xid)
+        if account:
+            mkey, acct = account
+            rec["a"] = self._remember(
+                await self.get_accounts(uid), {"m": mkey, "a": acct},
+                lambda a: a["m"] == mkey and a["a"] == acct,
+            )
+        rec["h"] = (await self.get_hist(uid) + [{"r": rid, "k": kind, "a": ref, "s": "p", "t": now}])[-HIST_MAX:]
+        await self.usave(uid)
     # ---------- User menu ----------
     def menu_markup(self, s, admin=False):
         rows = [[
@@ -613,7 +715,10 @@ class Bot:
                 {"text": "Support", "callback_data": "adm:set:support"},
                 {"text": "Stats", "callback_data": "adm:stats"},
             ],
-            [{"text": "Broadcast", "callback_data": "adm:bc"}],
+            [
+                {"text": "Broadcast", "callback_data": "adm:bc"},
+                {"text": "Bans", "callback_data": "adm:bans"},
+            ],
             [{"text": "Main menu", "callback_data": "menu"}],
         ]}
         return text, markup
@@ -675,7 +780,7 @@ class Bot:
             value = value[:500]
 
         s[key] = value
-        saved = await self.kv_set("settings", s)
+        saved = await self.save_settings(s)
         await self.clear_state(chat_id)
         if saved:
             note = f"<b>Saved</b> · {esc(label)}\n\n"
@@ -763,6 +868,7 @@ class Bot:
                 continue
             desc = str(d.get("description", "")).lower()
             if code == 403 or "chat not found" in desc or "user is deactivated" in desc:
+                _SEEN.discard(str(uid))
                 try:
                     await self.kv.delete(f"user:{uid}")
                 except Exception:
@@ -790,10 +896,129 @@ class Bot:
             {"inline_keyboard": [[{"text": "Back to panel", "callback_data": "adm:home"}]]},
         )
 
+    # ---------- Bans (admin) ----------
+    async def bans(self, fresh=False):
+        """{user id: {"n": name, "t": time}}. One KV key, kept in memory for CACHE_TTL seconds, so checking
+        every update against it costs (almost) nothing. fresh=True re-reads it (used before changing it)."""
+        if self.kv is None:
+            return {}
+        hit = _CACHE.get("bans")
+        now = time.time()
+        if hit and hit[0] > now and not fresh:
+            return hit[1]
+        try:
+            raw = await self.kv.get("bans")
+            data = json.loads(raw) if isinstance(raw, str) else None
+        except Exception:
+            print("bans read error", traceback.format_exc())
+            return hit[1] if hit else {}  # keep the last known list; a failed read is not remembered
+        if not isinstance(data, dict):
+            data = await self._import_old_bans()
+        _CACHE["bans"] = (now + CACHE_TTL, data)
+        return data
+
+    async def _import_old_bans(self):
+        """Once: the previous version stored one key per banned user (ban:<id>)."""
+        out = {}
+        for i in await self._list_ids("ban:"):
+            old = await self.kv_get(f"ban:{i}", {})
+            old = old if isinstance(old, dict) else {}
+            out[i] = {"n": old.get("n") or "", "t": int(old.get("t") or 0)}
+        await self.kv_set("bans", out)
+        return out
+
+    async def _save_bans(self, bans):
+        if not await self.kv_set("bans", bans):
+            return False
+        _CACHE["bans"] = (time.time() + CACHE_TTL, bans)
+        return True
+
+    async def is_banned(self, uid):
+        """Banned users are ignored by the bot. Admins can never be banned."""
+        if self.kv is None or self.is_admin(uid):
+            return False
+        return str(uid) in await self.bans()
+
+    async def ban_user(self, uid):
+        """Returns 'ok', 'already', 'admin' or 'nostorage'."""
+        uid = str(uid)
+        if self.is_admin(uid):
+            return "admin"
+        if self.kv is None:
+            return "nostorage"
+        bans = await self.bans(fresh=True)
+        if uid in bans:
+            return "already"
+        name = ""
+        try:  # best effort: keep the name so the Bans list shows who it is, not just a number
+            d = as_json(await self.tg("getChat", {"chat_id": int(uid)}))
+            name = user_label((d or {}).get("result") or {})
+        except Exception:
+            print("ban name error", traceback.format_exc())
+        if not await self._save_bans({**bans, uid: {"n": name[:80], "t": int(time.time())}}):
+            return "nostorage"
+        return "ok"
+
+    async def unban_user(self, uid):
+        if self.kv is None:
+            return
+        bans = await self.bans(fresh=True)
+        if str(uid) in bans:
+            await self._save_bans({k: v for k, v in bans.items() if k != str(uid)})
+
+    async def list_banned(self):
+        """(total, [(user id, name), ...]) with the BAN_SHOW most recent bans."""
+        bans = await self.bans(fresh=True)
+        items = sorted(bans.items(), key=lambda it: -int((it[1] or {}).get("t") or 0) if isinstance(it[1], dict) else 0)
+        return len(items), [(i, (v.get("n") or "") if isinstance(v, dict) else "") for i, v in items[:BAN_SHOW]]
+    async def bans_view(self, note=""):
+        total, shown = await self.list_banned()
+        if shown:
+            body = card([(f"<code>{i}</code>", esc(n) if n else "–") for i, n in shown])
+            if total > len(shown):
+                body += f"\n<i>Showing {len(shown)} of {total}.</i>"
+        else:
+            body = "No banned users."
+        rows = [[{"text": f"Unban · {n or i}"[:40], "callback_data": f"adm:unban:{i}"}] for i, n in shown]
+        rows.append([{"text": "Ban a user", "callback_data": "adm:banask"}])
+        rows.append([{"text": "Back", "callback_data": "adm:home"}])
+        return f"<b>Banned users</b>\n\n{note}{body}", {"inline_keyboard": rows}
+
+    async def ask_ban(self, chat_id, error=False):
+        if self.kv is None:
+            return await self.ui(
+                chat_id,
+                "Banning needs storage. Connect a KV namespace named <code>SETTINGS</code> first.",
+                {"inline_keyboard": [[{"text": "Back", "callback_data": "adm:home"}]]},
+            )
+        note = err("That isn't a valid user ID. Send numbers only.") if error else ""
+        text = (
+            f"<b>Ban a user</b>\n\n{note}"
+            "Send the user's Telegram ID. You can find it on any request card.\n\n"
+            f"{self.how_to()}"
+        )
+        await self.step(chat_id, text, self.prompt_markup("User ID"), {"step": "ban"})
+
+    async def on_ban_msg(self, chat_id, text):
+        t = re.sub(r"\s+", "", text or "")
+        if not re.fullmatch(r"\d{5,15}", t):
+            return await self.ask_ban(chat_id, error=True)
+        res = await self.ban_user(t)
+        await self.clear_state(chat_id)
+        notes = {
+            "ok": f"<b>Banned</b> · <code>{t}</code>\n\n",
+            "already": err("That user is already banned."),
+            "admin": err("Admins can't be banned."),
+        }
+        note = notes.get(res) or err("Couldn't save. Connect a KV namespace named <code>SETTINGS</code> first.")
+        text_out, markup = await self.bans_view(note)
+        await self.ui(chat_id, text_out, markup)
+
     # ---------- Admin notification ----------
     async def send_to_admin(self, user, kind, amount, proof=None, account=None, xid=None,
                             code=None, method=None, tk=None):
-        """Notify every admin. Returns the request id carried by the Approve / Reject buttons."""
+        """Notify every admin. Returns (request id carried by the Approve / Reject buttons,
+        whether at least one admin received the card)."""
         rid = new_rid()
         title = "New deposit request" if kind == "d" else "New withdraw request"
         rows = [
@@ -811,13 +1036,15 @@ class Bot:
         if account:
             rows.append(("Account", f"<code>{esc(account)}</code>"))
         ref = amount if kind == "d" else code  # what the buttons carry: amount (deposit) or code (withdraw)
-        markup = {"inline_keyboard": [[
+        buttons = [[
             {"text": "Approve", "callback_data": f"ok:{kind}:{user['id']}:{ref}:{rid}"},
             {"text": "Reject", "callback_data": f"no:{kind}:{user['id']}:{ref}:{rid}"},
-        ]]}
+        ]]
+        if not self.is_admin(user["id"]):
+            buttons.append([{"text": "Ban user", "callback_data": f"bn:{user['id']}"}])
+        markup = {"inline_keyboard": buttons}
         msgs = []
         for aid in self.admins:
-            is_file = bool(proof and (proof.get("photo") or proof.get("document")))
             if kind == "d" and proof:
                 fwd = {
                     "chat_id": aid,
@@ -827,13 +1054,8 @@ class Bot:
                 cd = as_json(await self.tg("forwardMessage", fwd))  # real forward of the user's message
                 if not (cd and cd.get("ok")):
                     cd = as_json(await self.tg("copyMessage", fwd))  # fallback if forwarding is refused
-                if is_file:
-                    good = bool(cd and cd.get("ok"))
-                    await self.dbg(f"forward of file to admin {aid}: ok={good}" + ("" if good else f" {str(cd)[:300]}"))
             d = as_json(await self.send(aid, f"<b>{title}</b>\n\n{card(rows)}", markup))
             mid = ((d or {}).get("result") or {}).get("message_id")
-            if is_file:
-                await self.dbg(f"request card to admin {aid}: message_id={mid}" + ("" if mid else f" {str(d)[:300]}"))
             if mid:
                 msgs.append([aid, mid])
         # the record lets us ignore a second tap and update every admin's copy
@@ -842,7 +1064,7 @@ class Bot:
             {"k": kind, "u": user["id"], "a": ref, "m": msgs, "tk": tk, "s": "p"},
             REQ_TTL,
         )
-        return rid
+        return rid, bool(msgs)
 
     async def notify_decision(self, user_id, kind, ref, approved, reason):
         what = "Deposit" if kind == "d" else "Withdrawal"
@@ -872,42 +1094,38 @@ class Bot:
         await self.notify_decision(st["uid"], st["kind"], st["ref"], False, reason)
         await self.ui(chat_id, "<b>Rejected</b>\n\nThe user was notified.", back)
 
-    # ---------- Spam limit ----------
+    # ---------- Spam limit + one open request at a time (both live in the user's record) ----------
     async def rate_ok(self, uid):
         if self.kv is None or self.is_admin(uid):
             return True
-        d = await self.kv_get(f"rl:{uid}", {"n": 0, "t": 0})
-        if int(time.time()) - int(d.get("t", 0)) >= 3600:
-            return True
-        return int(d.get("n", 0)) < MAX_REQ_HOUR
+        n, t = (await self.urec(uid)).get("rl") or [0, 0]
+        return int(time.time()) - int(t) >= 3600 or int(n) < MAX_REQ_HOUR
 
-    async def rate_hit(self, uid):
+    async def has_open_request(self, uid):
+        """True while the user's last request is still waiting for an admin. Admins are never limited.
+        The lock frees itself after PEND_TTL in case nobody ever answers."""
         if self.kv is None or self.is_admin(uid):
-            return
-        now = int(time.time())
-        d = await self.kv_get(f"rl:{uid}", {"n": 0, "t": 0})
-        if now - int(d.get("t", 0)) >= 3600:
-            d = {"n": 1, "t": now}
-        else:
-            d["n"] = int(d.get("n", 0)) + 1
-        await self.kv_set(f"rl:{uid}", d, max(60, 3600 - (now - int(d["t"]))))
+            return False
+        p = (await self.urec(uid)).get("p")
+        return bool(p) and time.time() - int(p[1]) < PEND_TTL
 
     # ---------- Request history ("My requests") ----------
-    async def hist_add(self, uid, rid, kind, amount):
-        if self.kv is None:
-            return
-        items = await self._saved(f"hist:{uid}")
-        items.append({"r": rid, "k": kind, "a": amount, "s": "p", "t": int(time.time())})
-        await self.kv_set(f"hist:{uid}", items[-HIST_MAX:])
-
     async def hist_update(self, uid, rid, status):
+        """The admin decided: show it in the user's history and free the one-open-request lock."""
         if self.kv is None or not rid:
             return
-        items = await self._saved(f"hist:{uid}")
-        for it in items:
-            if isinstance(it, dict) and it.get("r") == rid:
+        rec = await self.urec(uid)
+        changed = False
+        for it in rec.get("h") or []:
+            if isinstance(it, dict) and it.get("r") == rid and it.get("s") != status:
                 it["s"] = status
-        await self.kv_set(f"hist:{uid}", items)
+                changed = True
+        p = rec.get("p")
+        if p and p[0] == rid:
+            del rec["p"]
+            changed = True
+        if changed:
+            await self.usave(uid)
 
     def hist_view(self, items):
         names = {"p": "Pending", "a": "Approved", "r": "Rejected"}
@@ -1016,21 +1234,6 @@ class Bot:
         await self.show_pay_step(chat_id, amount, xid, s)
 
     async def on_proof(self, msg, amount, xid):
-        is_file = bool(msg.get("photo") or msg.get("document"))
-        try:
-            if is_file:
-                await self.dbg(f"on_proof start: amount={amount}, xid={xid}")
-            result = await self._on_proof(msg, amount, xid)
-            if is_file:
-                await self.dbg("on_proof finished")
-            return result
-        except Exception:
-            if is_file:
-                await self.dbg("on_proof EXCEPTION:\n" + traceback.format_exc()[-700:])
-            raise
-
-    async def _on_proof(self, msg, amount, xid):
-        is_file = bool(msg.get("photo") or msg.get("document"))
         chat_id = msg["chat"]["id"]
         uid = msg["from"]["id"]
         s = await self.settings()
@@ -1043,18 +1246,17 @@ class Bot:
         if not xid:
             return await self.ask_xbet(chat_id, amount)  # safety net
         if not await self.rate_ok(uid):
-            if is_file:
-                await self.dbg("stopped: spam limit")
             await self.clear_state(chat_id)
             return await self.ui(
                 chat_id, "Too many requests. Please try again later.",
                 self.menu_markup(s, self.is_admin(uid)),
             )
+        if await self.has_open_request(uid):
+            await self.clear_state(chat_id)
+            return await self.ui(chat_id, OPEN_MSG, self.menu_markup(s, self.is_admin(uid)))
 
         # the proof must be a screenshot / file, or a transaction ID that looks real
         ident = proof_ident(msg)
-        if is_file:
-            await self.dbg(f"proof id: {ident}")
         if not ident:
             return await self.proof_error(
                 chat_id, amount, xid, s, "Send a screenshot or a valid transaction ID.",
@@ -1062,22 +1264,15 @@ class Bot:
         tk = None
         if self.kv is not None and not self.is_admin(uid):  # admins can test with the same screenshot
             tk = hkey("txn:", ident)
-            dup = await self.kv_exists(tk)
-            if is_file:
-                await self.dbg(f"duplicate receipt: {dup}")
-            if dup:
+            if await self.kv_exists(tk):
                 return await self.proof_error(
                     chat_id, amount, xid, s, "This receipt was already used. Send a different one.",
                 )
 
-        rid = await self.send_to_admin(msg["from"], "d", amount, proof=msg, xid=xid, tk=tk)
-        if is_file:
-            await self.dbg(f"request {rid} created")
+        rid, delivered = await self.send_to_admin(msg["from"], "d", amount, proof=msg, xid=xid, tk=tk)
         if tk:
             await self.kv_set(tk, 1, TXN_TTL)
-        await self.record_xid(chat_id, xid)
-        await self.hist_add(uid, rid, "d", amount)
-        await self.rate_hit(uid)
+        await self.note_request(uid, rid, "d", amount, delivered, xid=xid)
         await self.bump("dep_req")
         await self.clear_state(chat_id)
         # the user's proof stays in the chat, so remove the old prompt and confirm below it
@@ -1168,6 +1363,9 @@ class Bot:
                 chat_id, "Too many requests. Please try again later.",
                 self.menu_markup(s, self.is_admin(user["id"])),
             )
+        if await self.has_open_request(user["id"]):
+            await self.clear_state(chat_id)
+            return await self.ui(chat_id, OPEN_MSG, self.menu_markup(s, self.is_admin(user["id"])))
         tk = hkey("wc:", code) if self.kv is not None else None  # case sensitive
         if tk and await self.kv_exists(tk):
             await self.clear_state(chat_id)
@@ -1176,14 +1374,12 @@ class Bot:
                 self.menu_markup(s, self.is_admin(user["id"])),
             )
 
-        rid = await self.send_to_admin(
+        rid, delivered = await self.send_to_admin(
             user, "w", None, account=account, code=code, method=METHODS[mkey], tk=tk
         )
         if tk:
             await self.kv_set(tk, 1, TXN_TTL)
-        await self.record_account(chat_id, mkey, account)
-        await self.hist_add(user["id"], rid, "w", code)
-        await self.rate_hit(user["id"])
+        await self.note_request(user["id"], rid, "w", code, delivered, account=(mkey, account))
         await self.bump("wit_req")
         await self.clear_state(chat_id)
         await self.ui(
@@ -1236,7 +1432,7 @@ class Bot:
             if text.startswith("/help"):
                 out, markup = self.help_view(uid)
             else:
-                out, markup = self.hist_view(await self._saved(f"hist:{uid}"))
+                out, markup = self.hist_view(await self.get_hist(uid))
             return await self.ui(chat_id, out, markup)
 
         # Admin is typing the reason for a rejection
@@ -1251,6 +1447,12 @@ class Bot:
         # Admin is composing a broadcast: any message type is accepted
         if step == "bc" and self.is_admin(uid):
             return await self.on_broadcast_msg(msg)
+
+        # Admin is typing the ID of a user to ban
+        if step == "ban" and self.is_admin(uid):
+            if self.kv is not None:
+                await self.delete(chat_id, msg["message_id"])
+            return await self.on_ban_msg(chat_id, text)
 
         # Fallback when storage is off: work out the step from the message being replied to
         if not step and reply:
@@ -1276,11 +1478,6 @@ class Bot:
                         "method": LABEL_TO_KEY[mm.group(1)],
                     }
 
-        if DEBUG_PROOF and (msg.get("photo") or msg.get("document")):
-            await self.dbg(
-                f"file received from {uid}: step={step!r}, photo={bool(msg.get('photo'))}, "
-                f"document={bool(msg.get('document'))}, state keys={sorted(state.keys()) if state else []}"
-            )
 
         # Keep the chat tidy: remove typed answers (the payment proof stays)
         if self.kv is not None and step in ("set", "dep1", "dep2", "wit1", "wit2", "wit3"):
@@ -1327,6 +1524,8 @@ class Bot:
                 return await self.answer(q, "Temporarily unavailable. Please try again later.", True)
             if not await self.rate_ok(uid):
                 return await self.answer(q, "Too many requests. Please try again later.", True)
+            if await self.has_open_request(uid):
+                return await self.answer(q, OPEN_MSG, True)
             await self.answer(q)
             if is_dep:
                 return await self.ask_amount(chat_id, s)
@@ -1403,7 +1602,7 @@ class Bot:
 
         if data == "hist":
             await self.answer(q)
-            out, markup = self.hist_view(await self._saved(f"hist:{uid}"))
+            out, markup = self.hist_view(await self.get_hist(uid))
             return await self.ui(chat_id, out, markup)
 
         # Admin skipped the rejection reason
@@ -1437,11 +1636,14 @@ class Bot:
             who = q["from"].get("first_name") or "admin"
             label = f"{'Approved' if approved else 'Rejected'} by {who}"[:60]
             targets = rec["m"] if rec and rec.get("m") else [[chat_id, q["message"]["message_id"]]]
+            done_rows = [[{"text": label, "callback_data": "noop"}]]
+            if not self.is_admin(user_id):  # the Ban button stays on the card after the decision
+                done_rows.append([{"text": "Ban user", "callback_data": f"bn:{user_id}"}])
             for c, m in targets:  # every admin's copy shows the result
                 await self.tg("editMessageReplyMarkup", {
                     "chat_id": c,
                     "message_id": m,
-                    "reply_markup": {"inline_keyboard": [[{"text": label, "callback_data": "noop"}]]},
+                    "reply_markup": {"inline_keyboard": done_rows},
                 })
             await self.bump(f"{'dep' if kind == 'd' else 'wit'}_{'ok' if approved else 'no'}")
             await self.hist_update(user_id, rid, "a" if approved else "r")
@@ -1465,6 +1667,21 @@ class Bot:
                 {"step": "reason", "uid": user_id, "kind": kind, "ref": ref},
             )
 
+        # Admin tapped "Ban user" on a request card
+        if data.startswith("bn:"):
+            if not self.is_admin(uid):
+                return await self.answer(q, "Not allowed", True)
+            target = data[3:]
+            if not target.isdigit():
+                return await self.answer(q)
+            res = await self.ban_user(target)
+            popup = {
+                "ok": f"User {target} is banned.",
+                "already": f"User {target} is already banned.",
+                "admin": "Admins can't be banned.",
+            }
+            return await self.answer(q, popup.get(res, "Storage not connected: can't ban."), True)
+
         if data.startswith("adm:"):
             if not self.is_admin(uid):
                 return await self.answer(q, "Admins only", True)
@@ -1474,11 +1691,23 @@ class Bot:
             if parts[1] == "bc":
                 await self.answer(q)
                 return await self.ask_broadcast(chat_id)
+            if parts[1] == "bans":
+                await self.answer(q)
+                text, markup = await self.bans_view()
+                return await self.ui(chat_id, text, markup)
+            if parts[1] == "banask":
+                await self.answer(q)
+                return await self.ask_ban(chat_id)
+            if parts[1] == "unban" and len(parts) == 3 and parts[2].isdigit():
+                await self.answer(q)
+                await self.unban_user(parts[2])
+                text, markup = await self.bans_view(f"<b>Unbanned</b> · <code>{parts[2]}</code>\n\n")
+                return await self.ui(chat_id, text, markup)
             s = await self.settings()
             if parts[1] in ("tdep", "twit"):
                 key = "dep_on" if parts[1] == "tdep" else "wit_on"
                 s[key] = not s[key]
-                if not await self.kv_set("settings", s):
+                if not await self.save_settings(s):
                     return await self.answer(q, "Storage not connected: can't save.", True)
             await self.answer(q)
             if parts[1] == "set" and len(parts) == 3 and parts[2] in SETTING_INFO:
@@ -1553,13 +1782,21 @@ class Default(WorkerEntrypoint):
             bot = Bot(self.env)
             if update.get("message"):
                 msg = update["message"]
-                if msg["chat"].get("type") == "private":
-                    await bot.touch(msg["from"]["id"])
-                await bot.on_message(msg)
+                private = msg["chat"].get("type") == "private"
+                if await bot.is_banned(msg["from"]["id"]):
+                    if private:
+                        await bot.send(msg["chat"]["id"], BAN_MSG)
+                else:
+                    if private:
+                        await bot.touch(msg["from"]["id"])
+                    await bot.on_message(msg)
             elif update.get("callback_query"):
                 q = update["callback_query"]
-                await bot.touch(q["from"]["id"])
-                await bot.on_callback(q)
+                if await bot.is_banned(q["from"]["id"]):
+                    await bot.answer(q, BAN_MSG, True)
+                else:
+                    await bot.touch(q["from"]["id"])
+                    await bot.on_callback(q)
         except Exception:
             tb = traceback.format_exc()
             print("ERROR:", tb)
