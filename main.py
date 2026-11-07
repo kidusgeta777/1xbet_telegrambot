@@ -26,10 +26,9 @@ from workers import WorkerEntrypoint, Response
 DEP1 = "Deposit · Step 1 of 3"
 DEP2 = "Deposit · Step 2 of 3"
 DEP3 = "Deposit · Step 3 of 3"
-WIT1 = "Withdraw · Step 1 of 4"
-WIT2 = "Withdraw · Step 2 of 4"
-WIT3 = "Withdraw · Step 3 of 4"
-WIT4 = "Withdraw · Step 4 of 4"
+WIT1 = "Withdraw · Step 1 of 3"
+WIT2 = "Withdraw · Step 2 of 3"
+WIT3 = "Withdraw · Step 3 of 3"
 SET_MARK = "Admin setting"
 
 MAX_SAVED = 3  # saved 1xBet IDs / withdraw accounts per user
@@ -48,8 +47,6 @@ DEFAULTS = {
     "wit_on": True,
     "min_dep": 50,
     "max_dep": 100000,
-    "min_wit": 100,
-    "max_wit": 100000,
     "pay_info": "Ask the admin for payment details.",
     "welcome": "Request a deposit or withdrawal in just a few taps.",
     "support": "",
@@ -60,8 +57,6 @@ STATS0 = {"dep_req": 0, "dep_ok": 0, "dep_no": 0, "wit_req": 0, "wit_ok": 0, "wi
 SETTING_INFO = {
     "min_dep": ("Minimum deposit (ETB)", "number"),
     "max_dep": ("Maximum deposit (ETB)", "number"),
-    "min_wit": ("Minimum withdrawal (ETB)", "number"),
-    "max_wit": ("Maximum withdrawal (ETB)", "number"),
     "pay_info": ("Payment details shown to depositors", "rich"),
     "welcome": ("Welcome message", "rich"),
     "support": ("Support username, without @ (send - to clear)", "text"),
@@ -238,8 +233,9 @@ def parse_xbet_id(text):
 
 
 def parse_wit_code(text):
+    """Withdraw code: exactly 4 letters / digits, upper and lower case are different."""
     t = str(text or "").strip().replace(" ", "")
-    return t if re.fullmatch(r"[A-Za-z0-9]{3,20}", t) else None
+    return t if re.fullmatch(r"[A-Za-z0-9]{4}", t) else None
 
 
 def parse_account(method, text):
@@ -445,7 +441,7 @@ class Bot:
             if notify and isinstance(raw, str):
                 st = json.loads(raw)
                 if st.get("step") == "reason":
-                    await self.notify_decision(st["uid"], st["kind"], st["amount"], False, None)
+                    await self.notify_decision(st["uid"], st["kind"], st["ref"], False, None)
         except Exception:
             print("state delete error", traceback.format_exc())
 
@@ -568,7 +564,6 @@ class Bot:
             ("Deposits", "<b>On</b>" if s["dep_on"] else "<b>Off</b>"),
             ("Withdrawals", "<b>On</b>" if s["wit_on"] else "<b>Off</b>"),
             ("Deposit limits", f"{fmt(s['min_dep'])} – {fmt(s['max_dep'])} ETB"),
-            ("Withdraw limits", f"{fmt(s['min_wit'])} – {fmt(s['max_wit'])} ETB"),
             ("Support", support),
         ]
         text = f"<b>Admin panel</b>\n\n{note}{warn}{card(rows)}\n\nTap an option to change it."
@@ -580,10 +575,6 @@ class Bot:
             [
                 {"text": "Min deposit", "callback_data": "adm:set:min_dep"},
                 {"text": "Max deposit", "callback_data": "adm:set:max_dep"},
-            ],
-            [
-                {"text": "Min withdraw", "callback_data": "adm:set:min_wit"},
-                {"text": "Max withdraw", "callback_data": "adm:set:max_wit"},
             ],
             [
                 {"text": "Payment info", "callback_data": "adm:set:pay_info"},
@@ -784,14 +775,16 @@ class Bot:
             rows.append(("1xBet ID", f"<code>{esc(xid)}</code>"))
         if code:
             rows.append(("Withdraw code", f"<code>{esc(code)}</code>"))
-        rows.append(("Amount", f"<b>{fmt(amount)} ETB</b>"))
+        if amount is not None:
+            rows.append(("Amount", f"<b>{fmt(amount)} ETB</b>"))
         if method:
             rows.append(("Method", esc(method)))
         if account:
             rows.append(("Account", f"<code>{esc(account)}</code>"))
+        ref = amount if kind == "d" else code  # what the buttons carry: amount (deposit) or code (withdraw)
         markup = {"inline_keyboard": [[
-            {"text": "Approve", "callback_data": f"ok:{kind}:{user['id']}:{amount}:{rid}"},
-            {"text": "Reject", "callback_data": f"no:{kind}:{user['id']}:{amount}:{rid}"},
+            {"text": "Approve", "callback_data": f"ok:{kind}:{user['id']}:{ref}:{rid}"},
+            {"text": "Reject", "callback_data": f"no:{kind}:{user['id']}:{ref}:{rid}"},
         ]]}
         msgs = []
         for aid in self.admins:
@@ -808,12 +801,12 @@ class Bot:
         # the record lets us ignore a second tap and update every admin's copy
         await self.kv_set(
             f"req:{rid}",
-            {"k": kind, "u": user["id"], "a": amount, "m": msgs, "tk": tk, "s": "p"},
+            {"k": kind, "u": user["id"], "a": ref, "m": msgs, "tk": tk, "s": "p"},
             REQ_TTL,
         )
         return rid
 
-    async def notify_decision(self, user_id, kind, amount, approved, reason):
+    async def notify_decision(self, user_id, kind, ref, approved, reason):
         what = "Deposit" if kind == "d" else "Withdrawal"
         if approved:
             title, note = f"{what} approved", "Thank you."
@@ -821,10 +814,14 @@ class Bot:
             title = f"{what} rejected"
             note = f"<b>Reason</b>\n<blockquote>{esc(reason)}</blockquote>\n\n" if reason else ""
             note += "Please contact support if you have questions."
+        if kind == "d":
+            info = card([("Amount", f"<b>{fmt(ref)} ETB</b>")])
+        else:
+            info = card([("Withdraw code", f"<code>{esc(str(ref))}</code>")])
         s = await self.settings()
         await self.send(
             user_id,
-            f"<b>{title}</b>\n\n{card([('Amount', f'<b>{fmt(amount)} ETB</b>')])}\n\n{note}",
+            f"<b>{title}</b>\n\n{info}\n\n{note}",
             self.menu_markup(s, self.is_admin(user_id)),
         )
 
@@ -834,7 +831,7 @@ class Bot:
         if st.get("step") != "reason":
             return await self.ui(chat_id, "Nothing to send.", back)
         await self.clear_state(chat_id, notify=False)
-        await self.notify_decision(st["uid"], st["kind"], st["amount"], False, reason)
+        await self.notify_decision(st["uid"], st["kind"], st["ref"], False, reason)
         await self.ui(chat_id, "<b>Rejected</b>\n\nThe user was notified.", back)
 
     # ---------- Spam limit ----------
@@ -884,7 +881,8 @@ class Bot:
             for it in reversed(items):
                 what = "Deposit" if it["k"] == "d" else "Withdrawal"
                 day = time.strftime("%d %b", time.gmtime(int(it.get("t", 0)) + 3 * 3600))  # Ethiopia, UTC+3
-                rows.append((day, f"{what} {fmt(it['a'])} ETB · {names.get(it.get('s'), '')}"))
+                detail = f"{fmt(it['a'])} ETB" if it["k"] == "d" else f"code {esc(str(it['a']))}"
+                rows.append((day, f"{what} {detail} · {names.get(it.get('s'), '')}"))
             body = card(rows)
         markup = {"inline_keyboard": [[{"text": "Main menu", "callback_data": "menu"}]]}
         return f"<b>Your requests</b>\n\n{body}", markup
@@ -893,7 +891,7 @@ class Bot:
         lines = [
             "<b>Help</b>\n",
             "<b>Deposit</b> · send the amount, your 1xBet ID, then your payment proof.",
-            "<b>Withdraw</b> · send your withdraw code, the amount, then where to receive the money.",
+            "<b>Withdraw</b> · send your 4-character withdraw code, then where to receive the money.",
             "<b>My requests</b> · your latest requests and their status.\n",
             "/start · main menu",
             "/history · your requests",
@@ -1024,12 +1022,14 @@ class Bot:
             self.menu_markup(s, self.is_admin(uid)),
         )
 
-    # ---------- Withdraw flow: code -> amount -> method / saved account -> account ----------
-    async def ask_wit_code(self, chat_id, error=False):
-        note = err(error) if isinstance(error, str) else err("Invalid code. Use letters and numbers only (3–20 characters).") if error else ""
+    # ---------- Withdraw flow: code -> method / saved account -> account ----------
+    async def ask_wit_code(self, chat_id, error=None):
+        note = err(error) if error else ""
         text = (
             f"{head(WIT1)}\n\n{note}"
-            f"Send your <b>withdraw code</b>.\n{self.how_to()}"
+            "Send your <b>withdraw code</b>.\n"
+            "<i>4 characters, letters and numbers. Capital and small letters are different.</i>\n\n"
+            f"{self.how_to()}"
         )
         await self.step(chat_id, text, self.prompt_markup("Withdraw code"), {"step": "wit1"})
 
@@ -1040,46 +1040,24 @@ class Bot:
             return await self.ui(chat_id, "Withdrawals are temporarily unavailable. Please try again later.")
         code = parse_wit_code(text)
         if not code:
-            return await self.ask_wit_code(chat_id, error=True)
-        if await self.kv_exists(hkey("wc:", code.upper())):
-            return await self.ask_wit_code(chat_id, error="This withdraw code was already used.")
-        await self.ask_wit_amount(chat_id, code, s)
+            return await self.ask_wit_code(chat_id, error="Invalid code. It must be exactly 4 letters or numbers.")
+        if await self.kv_exists(hkey("wc:", code)):
+            return await self.ask_wit_code(chat_id, error="This code is already waiting for the admin's review.")
+        await self.ask_wit_method(chat_id, code)
 
-    async def ask_wit_amount(self, chat_id, code, s, error=False):
-        lo, hi = s["min_wit"], s["max_wit"]
-        note = err(f"Enter a valid amount between {fmt(lo)} and {fmt(hi)} ETB.") if error else ""
-        text = (
-            f"{head(WIT2)}\n\n{note}"
-            f"{card([('Withdraw code', esc(code))])}\n\n"
-            f"Enter the amount in <b>ETB</b>.\n<i>Min {fmt(lo)} · Max {fmt(hi)}</i>\n\n"
-            f"{self.how_to()}"
-        )
-        await self.step(chat_id, text, self.prompt_markup("Amount in ETB"), {"step": "wit2", "code": code})
-
-    async def on_wit_amount(self, chat_id, code, text):
-        s = await self.settings()
-        if not s["wit_on"]:
-            await self.clear_state(chat_id)
-            return await self.ui(chat_id, "Withdrawals are temporarily unavailable. Please try again later.")
-        amount = parse_amount(text)
-        if amount is None or amount < s["min_wit"] or amount > s["max_wit"]:
-            return await self.ask_wit_amount(chat_id, code, s, error=True)
-        await self.ask_wit_method(chat_id, amount, code)
-
-    async def ask_wit_method(self, chat_id, amount, code):
+    async def ask_wit_method(self, chat_id, code):
         saved = await self.get_accounts(chat_id)
-        pre = f"{amount}:{code}"
         rows = []
         # one-tap saved accounts, e.g. "CBE · 1000010201"
         for a in saved:
             rows.append([{
                 "text": f"{METHODS[a['m']]} · {a['a']}",
-                "callback_data": f"sa:{a['m']}:{a['a']}:{pre}",
+                "callback_data": f"sa:{a['m']}:{a['a']}:{code}",
             }])
         rows.append([
-            {"text": "CBE", "callback_data": f"wm:c:{pre}"},
-            {"text": "Telebirr", "callback_data": f"wm:t:{pre}"},
-            {"text": "CBE Birr", "callback_data": f"wm:b:{pre}"},
+            {"text": "CBE", "callback_data": f"wm:c:{code}"},
+            {"text": "Telebirr", "callback_data": f"wm:t:{code}"},
+            {"text": "CBE Birr", "callback_data": f"wm:b:{code}"},
         ])
         rows.append([{"text": "Cancel", "callback_data": "cancel"}])
 
@@ -1087,33 +1065,26 @@ class Bot:
             "Tap a saved account to send instantly, or pick a method below to use a new one."
             if saved else "Choose where you want to receive your money."
         )
-        text = (
-            f"{head(WIT3)}\n\n"
-            f"{card([('Withdraw code', esc(code)), ('Amount', f'<b>{fmt(amount)} ETB</b>')])}\n\n"
-            f"{hint}"
-        )
-        await self.step(
-            chat_id, text, {"inline_keyboard": rows},
-            {"step": "wit3", "amount": str(amount), "code": code},
-        )
+        text = f"{head(WIT2)}\n\n{card([('Withdraw code', esc(code))])}\n\n{hint}"
+        await self.step(chat_id, text, {"inline_keyboard": rows}, {"step": "wit2", "code": code})
 
-    async def ask_wit_account(self, chat_id, amount, code, mkey, error=False):
+    async def ask_wit_account(self, chat_id, code, mkey, error=False):
         if mkey == "c":
             hint, ph = "13-digit CBE account number", "CBE account number"
         else:
             hint, ph = f"{METHODS[mkey]} phone number (09… or 07…)", "Phone number"
         note = err(f"Invalid {hint}. Try again.") if error else ""
         text = (
-            f"{head(WIT4)}\n\n{note}"
-            f"{card([('Withdraw code', esc(code)), ('Amount', f'<b>{fmt(amount)} ETB</b>'), ('Method', METHODS[mkey])])}\n\n"
+            f"{head(WIT3)}\n\n{note}"
+            f"{card([('Withdraw code', esc(code)), ('Method', METHODS[mkey])])}\n\n"
             f"Send your <b>{hint}</b>.\n{self.how_to()}"
         )
         await self.step(
             chat_id, text, self.prompt_markup(ph),
-            {"step": "wit4", "amount": str(amount), "code": code, "method": mkey},
+            {"step": "wit3", "code": code, "method": mkey},
         )
 
-    async def submit_withdraw(self, user, chat_id, amount, code, mkey, account):
+    async def submit_withdraw(self, user, chat_id, code, mkey, account):
         """Final step, shared by typed accounts and saved-account buttons."""
         s = await self.settings()
         if not s["wit_on"]:
@@ -1128,40 +1099,42 @@ class Bot:
                 chat_id, "Too many requests. Please try again later.",
                 self.menu_markup(s, self.is_admin(user["id"])),
             )
-        tk = hkey("wc:", code.upper()) if self.kv is not None else None
+        tk = hkey("wc:", code) if self.kv is not None else None  # case sensitive
         if tk and await self.kv_exists(tk):
             await self.clear_state(chat_id)
             return await self.ui(
-                chat_id, "This withdraw code was already used.",
+                chat_id, "This code is already waiting for the admin's review.",
                 self.menu_markup(s, self.is_admin(user["id"])),
             )
 
         rid = await self.send_to_admin(
-            user, "w", amount, account=account, code=code, method=METHODS[mkey], tk=tk
+            user, "w", None, account=account, code=code, method=METHODS[mkey], tk=tk
         )
         if tk:
             await self.kv_set(tk, 1, TXN_TTL)
         await self.record_account(chat_id, mkey, account)
-        await self.hist_add(user["id"], rid, "w", amount)
+        await self.hist_add(user["id"], rid, "w", code)
         await self.rate_hit(user["id"])
         await self.bump("wit_req")
         await self.clear_state(chat_id)
         await self.ui(
             chat_id,
             "<b>Request sent</b>\n\n"
-            f"{card([('Withdrawal', f'<b>{fmt(amount)} ETB</b>'), (METHODS[mkey], f'<code>{esc(account)}</code>')])}\n\n"
+            f"{card([('Withdraw code', esc(code)), (METHODS[mkey], f'<code>{esc(account)}</code>')])}\n\n"
             "The admin will review it. You'll be notified here.",
             self.menu_markup(s, self.is_admin(user["id"])),
         )
 
-    async def on_wit_account(self, msg, amount, code, mkey, text):
+    async def on_wit_account(self, msg, code, mkey, text):
         chat_id = msg["chat"]["id"]
-        if mkey not in METHODS or not code:
-            return await self.ask_wit_method(chat_id, amount, code or "")
+        if not code:
+            return await self.ask_wit_code(chat_id)
+        if mkey not in METHODS:
+            return await self.ask_wit_method(chat_id, code)
         account = parse_account(mkey, text)
         if not account:
-            return await self.ask_wit_account(chat_id, amount, code, mkey, error=True)
-        await self.submit_withdraw(msg["from"], chat_id, amount, code, mkey, account)
+            return await self.ask_wit_account(chat_id, code, mkey, error=True)
+        await self.submit_withdraw(msg["from"], chat_id, code, mkey, account)
 
     # ---------- Routing ----------
     async def on_message(self, msg):
@@ -1228,17 +1201,14 @@ class Bot:
                     step, state = "dep2", {"amount": am.group(1).replace(",", "")}
                 elif am and xm and DEP3 in reply:
                     step, state = "dep3", {"amount": am.group(1).replace(",", ""), "xid": xm.group(1)}
-                elif cm and WIT2 in reply:
-                    step, state = "wit2", {"code": cm.group(1)}
-                elif am and cm and mm and WIT4 in reply:
-                    step, state = "wit4", {
-                        "amount": am.group(1).replace(",", ""),
+                elif cm and mm and WIT3 in reply:
+                    step, state = "wit3", {
                         "code": cm.group(1),
                         "method": LABEL_TO_KEY[mm.group(1)],
                     }
 
         # Keep the chat tidy: remove typed answers (the payment proof stays)
-        if self.kv is not None and step in ("set", "dep1", "dep2", "wit1", "wit2", "wit3", "wit4"):
+        if self.kv is not None and step in ("set", "dep1", "dep2", "wit1", "wit2", "wit3"):
             await self.delete(chat_id, msg["message_id"])
 
         if step == "set" and self.is_admin(uid):
@@ -1252,13 +1222,9 @@ class Bot:
         if step == "wit1":
             return await self.on_wit_code(chat_id, text)
         if step == "wit2" and state.get("code"):
-            return await self.on_wit_amount(chat_id, state["code"], text)
-        if step == "wit3" and state.get("amount") and state.get("code"):
-            return await self.ask_wit_method(chat_id, state["amount"], state["code"])
-        if step == "wit4" and state.get("amount") and state.get("code"):
-            return await self.on_wit_account(
-                msg, state["amount"], state["code"], state.get("method"), text
-            )
+            return await self.ask_wit_method(chat_id, state["code"])
+        if step == "wit3" and state.get("code"):
+            return await self.on_wit_account(msg, state["code"], state.get("method"), text)
 
         await self.menu(chat_id, uid)
 
@@ -1303,13 +1269,13 @@ class Bot:
             if not s["wit_on"]:
                 return await self.answer(q, "Temporarily unavailable. Please try again later.", True)
             try:
-                _, mkey, amount, code = data.split(":", 3)
+                _, mkey, code = data.split(":", 2)
             except ValueError:
                 return await self.answer(q)
-            if mkey not in METHODS:
+            if mkey not in METHODS or not parse_wit_code(code):
                 return await self.answer(q)
             await self.answer(q)
-            return await self.ask_wit_account(chat_id, amount, code, mkey)
+            return await self.ask_wit_account(chat_id, code, mkey)
 
         # Saved withdraw account: one tap sends the request
         if data.startswith("sa:"):
@@ -1317,14 +1283,11 @@ class Bot:
             if not s["wit_on"]:
                 return await self.answer(q, "Temporarily unavailable. Please try again later.", True)
             try:
-                _, mkey, account, amount, code = data.split(":", 4)
+                _, mkey, account, code = data.split(":", 3)
             except ValueError:
                 return await self.answer(q)
-            amt = parse_amount(amount)
-            if mkey not in METHODS or amt is None or not parse_account(mkey, account) or not parse_wit_code(code):
+            if mkey not in METHODS or not parse_account(mkey, account) or not parse_wit_code(code):
                 return await self.answer(q)
-            if amt < s["min_wit"] or amt > s["max_wit"]:
-                return await self.answer(q, "Amount is outside the allowed limits.", True)
             await self.answer(q)
             # remove the buttons first so a double tap can't send it twice
             await self.tg("editMessageReplyMarkup", {
@@ -1332,7 +1295,7 @@ class Bot:
                 "message_id": q["message"]["message_id"],
                 "reply_markup": {"inline_keyboard": []},
             })
-            return await self.submit_withdraw(q["from"], chat_id, amt, code, mkey, account)
+            return await self.submit_withdraw(q["from"], chat_id, code, mkey, account)
 
         # Admin confirmed the broadcast
         if data == "bc:go":
@@ -1370,7 +1333,7 @@ class Bot:
             parts = data.split(":")
             if len(parts) < 4 or parts[1] not in ("d", "w"):
                 return await self.answer(q)
-            action, kind, user_id, amount = parts[:4]
+            action, kind, user_id, ref = parts[:4]
             rid = parts[4] if len(parts) > 4 else None
             approved = action == "ok"
             rec = None
@@ -1397,23 +1360,23 @@ class Bot:
             await self.bump(f"{'dep' if kind == 'd' else 'wit'}_{'ok' if approved else 'no'}")
             await self.hist_update(user_id, rid, "a" if approved else "r")
 
-            if approved:
-                return await self.notify_decision(user_id, kind, amount, True, None)
-
-            if rec and rec.get("tk"):  # a rejected receipt / code may be used again
+            # a rejected receipt may be used again; a withdraw code is free again once handled
+            if rec and rec.get("tk") and (not approved or kind == "w"):
                 try:
                     await self.kv.delete(rec["tk"])
                 except Exception:
                     print("txn delete error", traceback.format_exc())
+            if approved:
+                return await self.notify_decision(user_id, kind, ref, True, None)
             if self.kv is None:  # no storage = can't wait for a reason
-                return await self.notify_decision(user_id, kind, amount, False, None)
+                return await self.notify_decision(user_id, kind, ref, False, None)
             await self.clear_state(chat_id)  # an unfinished earlier reason is sent without text
             self.pm = None  # new message, the request card above stays as it is
             return await self.step(
                 chat_id,
                 "<b>Reject reason</b>\n\nSend a short reason for the user, or tap Skip.\n\nType it below.",
                 {"inline_keyboard": [[{"text": "Skip", "callback_data": "rs:skip"}]]},
-                {"step": "reason", "uid": user_id, "kind": kind, "amount": amount},
+                {"step": "reason", "uid": user_id, "kind": kind, "ref": ref},
             )
 
         if data.startswith("adm:"):
