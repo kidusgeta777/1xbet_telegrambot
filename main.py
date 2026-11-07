@@ -1,6 +1,7 @@
 # Telegram deposit/withdraw bot with admin panel - Cloudflare Python Worker
 # Secrets/vars: BOT_TOKEN, ADMIN_ID. Optional KV binding named SETTINGS (saves admin settings, stats,
-# conversation state, and each user's saved 1xBet IDs / withdraw accounts).
+# conversation state, users for broadcast, and each user's saved 1xBet IDs / withdraw accounts).
+import asyncio
 import json
 import re
 import time
@@ -23,6 +24,7 @@ WIT4 = "Withdraw · Step 4 of 4"
 SET_MARK = "Admin setting"
 
 MAX_SAVED = 3  # saved 1xBet IDs / withdraw accounts per user
+MAX_TEXT = 1500  # max length of welcome / payment text
 
 # short key (used in callback_data) -> label
 METHODS = {"c": "CBE", "t": "Telebirr", "b": "CBE Birr"}
@@ -41,14 +43,14 @@ DEFAULTS = {
 }
 STATS0 = {"dep_req": 0, "dep_ok": 0, "dep_no": 0, "wit_req": 0, "wit_ok": 0, "wit_no": 0}
 
-# key -> (label, type)
+# key -> (label, type). Type "rich" = text that keeps formatting (stored as Telegram HTML).
 SETTING_INFO = {
     "min_dep": ("Minimum deposit (ETB)", "number"),
     "max_dep": ("Maximum deposit (ETB)", "number"),
     "min_wit": ("Minimum withdrawal (ETB)", "number"),
     "max_wit": ("Maximum withdrawal (ETB)", "number"),
-    "pay_info": ("Payment details shown to depositors", "text"),
-    "welcome": ("Welcome message", "text"),
+    "pay_info": ("Payment details shown to depositors", "rich"),
+    "welcome": ("Welcome message", "rich"),
     "support": ("Support username, without @ (send - to clear)", "text"),
 }
 
@@ -72,6 +74,110 @@ def card(rows):
 
 def err(text):
     return f"<i>{text}</i>\n\n"
+
+
+# ---------- Rich text: Telegram formatting / Markdown -> Telegram HTML ----------
+FORMAT_TYPES = {
+    "bold", "italic", "underline", "strikethrough", "spoiler", "code", "pre",
+    "text_link", "blockquote", "expandable_blockquote",
+}
+
+
+def _entity_tags(e):
+    t = e.get("type")
+    if t == "bold":
+        return "<b>", "</b>"
+    if t == "italic":
+        return "<i>", "</i>"
+    if t == "underline":
+        return "<u>", "</u>"
+    if t == "strikethrough":
+        return "<s>", "</s>"
+    if t == "spoiler":
+        return "<tg-spoiler>", "</tg-spoiler>"
+    if t == "code":
+        return "<code>", "</code>"
+    if t == "pre":
+        return "<pre>", "</pre>"
+    if t == "blockquote":
+        return "<blockquote>", "</blockquote>"
+    if t == "expandable_blockquote":
+        return "<blockquote expandable>", "</blockquote>"
+    if t == "text_link":
+        url = e.get("url") or ""
+        if url.startswith(("http://", "https://", "tg://")):
+            return f'<a href="{esc(url)}">', "</a>"
+    return None
+
+
+def entities_to_html(text, entities):
+    """Turn a message's Telegram entities (UTF-16 offsets) into HTML."""
+    data = text.encode("utf-16-le")
+    n = len(data) // 2
+    items = []
+    for e in entities or []:
+        tags = _entity_tags(e)
+        if not tags:
+            continue
+        start = e.get("offset", 0)
+        end = min(start + e.get("length", 0), n)
+        if start < n and end > start:
+            items.append((start, end, tags[0], tags[1]))
+    items.sort(key=lambda x: (x[0], -x[1]))
+
+    out, stack, pos = [], [], 0
+
+    def emit(upto):
+        nonlocal pos
+        if upto > pos:
+            out.append(esc(data[pos * 2:upto * 2].decode("utf-16-le", "replace")))
+            pos = upto
+
+    for start, end, o, c in items:
+        while stack and stack[-1][0] <= start:
+            emit(stack[-1][0])
+            out.append(stack.pop()[1])
+        emit(start)
+        out.append(o)
+        stack.append((end, c))
+    while stack:
+        emit(stack[-1][0])
+        out.append(stack.pop()[1])
+    emit(n)
+    return "".join(out)
+
+
+def markdown_to_html(text):
+    """Small Markdown subset: **bold**, __underline__, *italic* / _italic_, ~~strike~~, `code`, [text](url)."""
+    codes, links = [], []
+
+    def stash_code(m):
+        codes.append(m.group(1))
+        return f"\x00{len(codes) - 1}\x00"
+
+    t = re.sub(r"`([^`\n]+)`", stash_code, text)
+    t = esc(t)
+
+    def stash_link(m):
+        links.append(f'<a href="{m.group(2)}">{m.group(1)}</a>')
+        return f"\x01{len(links) - 1}\x01"
+
+    t = re.sub(r"\[([^\]\n]+)\]\(((?:https?|tg)://[^\s)]+)\)", stash_link, t)
+    t = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", t, flags=re.S)
+    t = re.sub(r"__(.+?)__", r"<u>\1</u>", t, flags=re.S)
+    t = re.sub(r"~~(.+?)~~", r"<s>\1</s>", t, flags=re.S)
+    t = re.sub(r"(?<![\w*])\*(?!\s)([^*\n]+?)(?<!\s)\*(?![\w*])", r"<i>\1</i>", t)
+    t = re.sub(r"(?<![\w_])_(?!\s)([^_\n]+?)(?<!\s)_(?![\w_])", r"<i>\1</i>", t)
+    t = re.sub(r"\x01(\d+)\x01", lambda m: links[int(m.group(1))], t)
+    t = re.sub(r"\x00(\d+)\x00", lambda m: f"<code>{esc(codes[int(m.group(1))])}</code>", t)
+    return t
+
+
+def to_html(text, entities):
+    """Keep whatever formatting the admin used: Telegram's own, or typed Markdown."""
+    if any(e.get("type") in FORMAT_TYPES for e in (entities or [])):
+        return entities_to_html(text, entities)
+    return markdown_to_html(text)
 
 
 # ---------- Parsing / validation ----------
@@ -139,10 +245,13 @@ class Bot:
             print(method, resp.status, body)
         return body
 
-    async def send(self, chat_id, text, markup=None):
+    async def send(self, chat_id, text, markup=None, reply_to=None):
         payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
         if markup:
             payload["reply_markup"] = markup
+        if reply_to:
+            payload["reply_to_message_id"] = reply_to
+            payload["allow_sending_without_reply"] = True
         return await self.tg("sendMessage", payload)
 
     async def edit(self, q, text, markup=None):
@@ -231,6 +340,37 @@ class Bot:
     def how_to(self):
         return "Type it below." if self.kv is not None else "Reply to this message."
 
+    # ---------- Users (for broadcast) ----------
+    async def touch(self, uid):
+        """Remember every user who talks to the bot."""
+        if self.kv is None or not uid:
+            return
+        try:
+            raw = await self.kv.get(f"user:{uid}")
+            if not isinstance(raw, str):
+                await self.kv.put(f"user:{uid}", "1")
+        except Exception:
+            print("touch error", traceback.format_exc())
+
+    async def list_users(self):
+        ids, cursor = [], None
+        if self.kv is None:
+            return ids
+        try:
+            while True:
+                opts = {"prefix": "user:", "limit": 1000}
+                if cursor:
+                    opts["cursor"] = cursor
+                res = await self.kv.list(to_js(opts, dict_converter=js.Object.fromEntries))
+                data = json.loads(js.JSON.stringify(res))
+                ids += [k["name"][5:] for k in data.get("keys", [])]
+                if data.get("list_complete") or not data.get("cursor"):
+                    break
+                cursor = data["cursor"]
+        except Exception:
+            print("list users error", traceback.format_exc())
+        return ids
+
     # ---------- Saved items (max 3 per user): withdraw accounts + 1xBet IDs ----------
     async def _saved(self, key):
         items = await self.kv_get(key, [])
@@ -290,7 +430,7 @@ class Bot:
         return {"inline_keyboard": rows}
 
     def menu_view(self, s, uid):
-        text = f"<b>Welcome</b>\n\n{esc(s['welcome'])}"
+        text = f"<b>Welcome</b>\n\n{s['welcome']}"  # already Telegram HTML
         return text, self.menu_markup(s, self.is_admin(uid))
 
     async def menu(self, chat_id, uid=None):
@@ -331,6 +471,7 @@ class Bot:
                 {"text": "Support", "callback_data": "adm:set:support"},
                 {"text": "Stats", "callback_data": "adm:stats"},
             ],
+            [{"text": "Broadcast", "callback_data": "adm:bc"}],
             [{"text": "Main menu", "callback_data": "menu"}],
         ]}
         return text, markup
@@ -355,7 +496,9 @@ class Bot:
             )
 
         text = f"<b>Stats</b>\n\n{block('Deposits', 'dep')}\n\n{block('Withdrawals', 'wit')}"
-        if self.kv is None:
+        if self.kv is not None:
+            text += f"\n\n<b>Users</b>\n{card([('Registered', len(await self.list_users()))])}"
+        else:
             text += "\n\n" + err("Storage not connected. Stats aren't being recorded.").strip()
         markup = {"inline_keyboard": [[{"text": "Back", "callback_data": "adm:home"}]]}
         return text, markup
@@ -367,7 +510,7 @@ class Bot:
         st[key] = st.get(key, 0) + 1
         await self.kv_set("stats", st)
 
-    async def save_setting(self, chat_id, key, text):
+    async def save_setting(self, chat_id, key, text, entities=None):
         if key not in SETTING_INFO:
             return await self.send_panel(chat_id)
         label, kind = SETTING_INFO[key]
@@ -377,6 +520,10 @@ class Bot:
             value = parse_amount(text)
             if value is None:
                 return await self.ask_setting(chat_id, key, error=True)
+        elif kind == "rich":
+            if not text.strip() or len(text) > MAX_TEXT:
+                return await self.ask_setting(chat_id, key, error=True)
+            value = to_html(text.strip(), entities)
         else:
             value = text.strip()
             if key == "support":
@@ -396,16 +543,102 @@ class Bot:
 
     async def ask_setting(self, chat_id, key, error=False):
         label, kind = SETTING_INFO[key]
-        note = err("That value isn't valid. Try again.") if error else ""
+        if error and kind == "rich":
+            note = err(f"That text isn't valid. Send up to {MAX_TEXT} characters.")
+        else:
+            note = err("That value isn't valid. Try again.") if error else ""
         hint = "a number" if kind == "number" else "your text"
+        extra = ""
+        if kind == "rich":
+            extra = (
+                "\n<i>Formatting is kept. Use Telegram's formatting, or type "
+                "**bold**, _italic_, __underline__, ~~strike~~, `code`, [text](https://link).</i>\n"
+            )
         ref = "" if self.kv is not None else f"\n\n<i>ref: {key}</i>"
         text = (
             f"<b>{SET_MARK}</b>\n\n{note}"
-            f"<b>{esc(label)}</b>\nSend {hint}.\n\n"
+            f"<b>{esc(label)}</b>\nSend {hint}.\n{extra}\n"
             f"{self.how_to()}{ref}"
         )
         await self.set_state(chat_id, {"step": "set", "key": key})
         await self.send(chat_id, text, self.prompt_markup(label[:60]))
+
+    # ---------- Broadcast (admin) ----------
+    async def ask_broadcast(self, chat_id):
+        if self.kv is None:
+            return await self.send(
+                chat_id, "Broadcast needs storage. Connect a KV namespace named <code>SETTINGS</code> first."
+            )
+        await self.set_state(chat_id, {"step": "bc"})
+        await self.send(
+            chat_id,
+            "<b>Broadcast</b>\n\n"
+            "Send the message everyone should receive. Text, photo, video or any file works, "
+            "and your formatting is kept.\n\nType it below.",
+            self.prompt_markup("Message to broadcast"),
+        )
+
+    async def on_broadcast_msg(self, msg):
+        chat_id = msg["chat"]["id"]
+        users = await self.list_users()
+        if not users:
+            await self.clear_state(chat_id)
+            return await self.send(chat_id, "No users registered yet.")
+        await self.set_state(chat_id, {"step": "bc_confirm", "mid": msg["message_id"]})
+        markup = {"inline_keyboard": [
+            [{"text": f"Send to {len(users)} users", "callback_data": "bc:go"}],
+            [{"text": "Cancel", "callback_data": "cancel"}],
+        ]}
+        await self.send(
+            chat_id,
+            f"<b>Broadcast</b>\n\nSend the message above to <b>{len(users)}</b> users?",
+            markup,
+            reply_to=msg["message_id"],
+        )
+
+    async def _copy_one(self, uid, from_chat, mid):
+        for _ in range(2):
+            body = await self.tg("copyMessage", {
+                "chat_id": int(uid), "from_chat_id": from_chat, "message_id": mid,
+            })
+            try:
+                d = json.loads(body)
+            except Exception:
+                return "fail"
+            if d.get("ok"):
+                return "ok"
+            code = d.get("error_code")
+            if code == 429:
+                wait = (d.get("parameters") or {}).get("retry_after", 1)
+                await asyncio.sleep(min(int(wait), 5))
+                continue
+            desc = str(d.get("description", "")).lower()
+            if code == 403 or "chat not found" in desc or "user is deactivated" in desc:
+                try:
+                    await self.kv.delete(f"user:{uid}")
+                except Exception:
+                    pass
+                return "blocked"
+            return "fail"
+        return "fail"
+
+    async def run_broadcast(self, admin_chat, mid):
+        ids = await self.list_users()
+        counts = {"ok": 0, "blocked": 0, "fail": 0}
+        for i in range(0, len(ids), 20):
+            results = await asyncio.gather(*[self._copy_one(u, admin_chat, mid) for u in ids[i:i + 20]])
+            for r in results:
+                counts[r] += 1
+            await asyncio.sleep(0.7)  # stay under Telegram's ~30 msg/sec limit
+        await self.send(
+            admin_chat,
+            "<b>Broadcast finished</b>\n\n"
+            + card([
+                ("Delivered", f"<b>{counts['ok']}</b>"),
+                ("Blocked the bot", counts["blocked"]),
+                ("Failed", counts["fail"]),
+            ]),
+        )
 
     # ---------- Admin notification ----------
     async def send_to_admin(self, msg, kind, amount, account=None, xid=None, code=None, method=None):
@@ -481,10 +714,12 @@ class Bot:
         await self.send(chat_id, text, markup)
 
     async def show_pay_step(self, chat_id, amount, xid, s):
+        pay = s["pay_info"]  # already Telegram HTML
+        pay_block = pay if "<blockquote" in pay else f"<blockquote>{pay}</blockquote>"
         body = (
             f"{head(DEP3)}\n\n"
             f"{card([('Amount', f'<b>{fmt(amount)} ETB</b>'), ('1xBet ID', f'<code>{xid}</code>')])}\n\n"
-            f"<b>Pay to</b>\n<blockquote>{esc(s['pay_info'])}</blockquote>\n\n"
+            f"<b>Pay to</b>\n{pay_block}\n\n"
             "After paying, send a <b>screenshot</b> or the <b>transaction ID</b>.\n"
             f"{self.how_to()}"
         )
@@ -666,6 +901,10 @@ class Bot:
         state = await self.get_state(chat_id) or {}
         step = state.get("step")
 
+        # Admin is composing a broadcast: any message type is accepted
+        if step == "bc" and self.is_admin(uid):
+            return await self.on_broadcast_msg(msg)
+
         # Fallback when storage is off: work out the step from the message being replied to
         if not step and reply:
             if SET_MARK in reply:
@@ -694,7 +933,7 @@ class Bot:
                     }
 
         if step == "set" and self.is_admin(uid):
-            return await self.save_setting(chat_id, state.get("key"), text)
+            return await self.save_setting(chat_id, state.get("key"), text, msg.get("entities"))
         if step == "dep1":
             return await self.on_amount(chat_id, text)
         if step == "dep2" and state.get("amount"):
@@ -788,6 +1027,18 @@ class Bot:
             })
             return await self.submit_withdraw(q["from"], chat_id, amt, code, mkey, account)
 
+        # Admin confirmed the broadcast
+        if data == "bc:go":
+            if not self.is_admin(uid):
+                return await self.answer(q, "Admins only", True)
+            state = await self.get_state(chat_id) or {}
+            if state.get("step") != "bc_confirm" or not state.get("mid"):
+                return await self.answer(q, "This broadcast has expired.", True)
+            await self.clear_state(chat_id)  # clear first so a retried update can't send it twice
+            await self.answer(q)
+            await self.edit(q, "<b>Broadcast</b>\n\nSending…")
+            return await self.run_broadcast(chat_id, state["mid"])
+
         if data in ("menu", "cancel"):
             await self.answer(q)
             await self.clear_state(chat_id)
@@ -826,6 +1077,9 @@ class Bot:
             parts = data.split(":")
             if parts[1] != "set":
                 await self.clear_state(chat_id)
+            if parts[1] == "bc":
+                await self.answer(q)
+                return await self.ask_broadcast(chat_id)
             s = await self.settings()
             if parts[1] in ("tdep", "twit"):
                 key = "dep_on" if parts[1] == "tdep" else "wit_on"
@@ -852,9 +1106,14 @@ class Default(WorkerEntrypoint):
             update = await request.json()
             bot = Bot(self.env)
             if update.get("message"):
-                await bot.on_message(update["message"])
+                msg = update["message"]
+                if msg["chat"].get("type") == "private":
+                    await bot.touch(msg["from"]["id"])
+                await bot.on_message(msg)
             elif update.get("callback_query"):
-                await bot.on_callback(update["callback_query"])
+                q = update["callback_query"]
+                await bot.touch(q["from"]["id"])
+                await bot.on_callback(q)
         except Exception:
             print("ERROR:", traceback.format_exc())
         return Response("OK")
