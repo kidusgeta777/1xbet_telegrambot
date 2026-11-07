@@ -267,13 +267,32 @@ def hkey(prefix, value):
     return prefix + hashlib.sha256(value.encode()).hexdigest()[:32]
 
 
+def _file_id(msg, key):
+    """Unique id of the photo / file. Works whether Telegram's data arrives as plain Python
+    or as JavaScript objects, and never raises (falls back to a random id)."""
+    try:
+        v = msg.get(key)
+        if key == "photo":
+            v = list(v)[-1]  # biggest size is last
+        for getter in (lambda o: o["file_unique_id"], lambda o: getattr(o, "file_unique_id")):
+            try:
+                got = getter(v)
+                if got:
+                    return str(got)
+            except Exception:
+                pass
+    except Exception:
+        print("file id error", traceback.format_exc())
+    return new_rid()
+
+
 def proof_ident(msg):
     """What identifies a payment proof: a photo / file id, or a normalised transaction ID.
     None means the message is not a usable proof."""
     if msg.get("photo"):
-        return "p:" + str(msg["photo"][-1].get("file_unique_id") or new_rid())
+        return "p:" + _file_id(msg, "photo")
     if msg.get("document"):
-        return "d:" + str(msg["document"].get("file_unique_id") or new_rid())
+        return "d:" + _file_id(msg, "document")
     t = re.sub(r"\s+", "", str(msg.get("text") or "")).upper()
     if len(t) >= 6 and re.search(r"\d", t) and not t.startswith("/"):
         return "t:" + t
