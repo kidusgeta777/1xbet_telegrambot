@@ -982,6 +982,13 @@ class Bot:
         )
         await self.step(chat_id, text, markup, {"step": "dep2", "amount": str(amount)})
 
+    async def proof_error(self, chat_id, amount, xid, s, error):
+        """Show the problem as a NEW message under the user's proof (an edit of the old prompt
+        up the chat would go unnoticed)."""
+        await self.delete(chat_id, self.pm)
+        self.pm = None
+        await self.show_pay_step(chat_id, amount, xid, s, error=error)
+
     async def show_pay_step(self, chat_id, amount, xid, s, error=None):
         pay = s["pay_info"]  # already Telegram HTML
         pay_block = pay if "<blockquote" in pay else f"<blockquote>{pay}</blockquote>"
@@ -1049,18 +1056,18 @@ class Bot:
         if is_file:
             await self.dbg(f"proof id: {ident}")
         if not ident:
-            return await self.show_pay_step(
-                chat_id, amount, xid, s, error="Send a screenshot or a valid transaction ID.",
+            return await self.proof_error(
+                chat_id, amount, xid, s, "Send a screenshot or a valid transaction ID.",
             )
         tk = None
-        if self.kv is not None:
+        if self.kv is not None and not self.is_admin(uid):  # admins can test with the same screenshot
             tk = hkey("txn:", ident)
             dup = await self.kv_exists(tk)
             if is_file:
                 await self.dbg(f"duplicate receipt: {dup}")
             if dup:
-                return await self.show_pay_step(
-                    chat_id, amount, xid, s, error="This receipt was already used. Send a different one.",
+                return await self.proof_error(
+                    chat_id, amount, xid, s, "This receipt was already used. Send a different one.",
                 )
 
         rid = await self.send_to_admin(msg["from"], "d", amount, proof=msg, xid=xid, tk=tk)
