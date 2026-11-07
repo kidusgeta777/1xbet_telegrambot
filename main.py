@@ -1234,7 +1234,8 @@ class Bot:
             f"<b>Pay to</b>\n{pay_block}\n\n"
             "⚠️ <b>Important:</b> send the money from the <b>same payment method</b> you pay to. "
             "If you pay to CBE, send from your CBE account; to Telebirr, send from Telebirr; "
-            "to CBE Birr, send from CBE Birr. Payments from a different method may be rejected.\n\n"
+            "to CBE Birr, send from CBE Birr. Sending from a different method can leave the money "
+            "stuck in transit, and the transfer may not complete successfully.\n\n"
             "After paying, send a <b>screenshot</b> or the <b>transaction ID</b>.\n"
             f"{self.how_to()}"
         )
