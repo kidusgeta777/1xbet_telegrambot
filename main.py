@@ -144,6 +144,44 @@ class Bot:
     def is_admin(self, uid):
         return bool(self.admin_id) and str(uid) == str(self.admin_id)
 
+    # ---------- Conversation state (so users can just type) ----------
+    async def get_state(self, cid):
+        if not self.kv:
+            return None
+        try:
+            raw = await self.kv.get(f"state:{cid}")
+            if isinstance(raw, str):
+                return json.loads(raw)
+        except Exception:
+            print("state read error", traceback.format_exc())
+        return None
+
+    async def set_state(self, cid, st):
+        if not self.kv:
+            return
+        try:
+            opts = to_js({"expirationTtl": 3600}, dict_converter=js.Object.fromEntries)
+            await self.kv.put(f"state:{cid}", json.dumps(st), opts)
+        except Exception:
+            print("state write error", traceback.format_exc())
+
+    async def clear_state(self, cid):
+        if not self.kv:
+            return
+        try:
+            await self.kv.delete(f"state:{cid}")
+        except Exception:
+            print("state delete error", traceback.format_exc())
+
+    def prompt_markup(self, placeholder):
+        # With storage the bot remembers the step, so no "reply" is needed.
+        if self.kv:
+            return {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "cancel"}]]}
+        return force_reply(placeholder)
+
+    def how_to(self):
+        return "Just type it below 👇" if self.kv else "↩️ Reply to this message."
+
     # ---------- User menu ----------
     def menu_markup(self, s, admin=False):
         rows = [[
@@ -175,9 +213,10 @@ class Bot:
         text = (
             f"<b>{title}</b>\n{LINE}\n{note}"
             f"Enter the amount in <b>ETB</b>.\n<i>Min {fmt(lo)} · Max {fmt(hi)}</i>\n\n"
-            "↩️ Reply to this message."
+            f"{self.how_to()}"
         )
-        await self.send(chat_id, text, force_reply("Amount in ETB"))
+        await self.set_state(chat_id, {"step": "dep1" if is_dep else "wit1"})
+        await self.send(chat_id, text, self.prompt_markup("Amount in ETB"))
 
     # ---------- Admin panel ----------
     def panel_view(self, s):
@@ -242,9 +281,7 @@ class Bot:
         st[key] = st.get(key, 0) + 1
         await self.kv_set("stats", st)
 
-    async def save_setting(self, chat_id, reply, text):
-        m = re.search(r"\(ref: (\w+)\)", reply)
-        key = m.group(1) if m else None
+    async def save_setting(self, chat_id, key, text):
         if key not in SETTING_INFO:
             return await self.send_panel(chat_id)
         label, kind = SETTING_INFO[key]
@@ -264,6 +301,7 @@ class Bot:
 
         s[key] = value
         saved = await self.kv_set("settings", s)
+        await self.clear_state(chat_id)
         if saved:
             await self.send(chat_id, f"✅ <b>Saved:</b> {esc(label)}")
         else:
@@ -276,9 +314,11 @@ class Bot:
         hint = "a number" if kind == "number" else "your text"
         text = (
             f"<b>⚙️ {SET_MARK}</b>\n{LINE}\n{note}"
-            f"<b>{esc(label)}</b>\nReply with {hint}.\n\n<i>(ref: {key})</i>"
+            f"<b>{esc(label)}</b>\nSend {hint}.\n\n"
+            f"{self.how_to()}\n<i>(ref: {key})</i>"
         )
-        await self.send(chat_id, text, force_reply(label[:60]))
+        await self.set_state(chat_id, {"step": "set", "key": key})
+        await self.send(chat_id, text, self.prompt_markup(label[:60]))
 
     # ---------- Requests ----------
     async def send_to_admin(self, msg, kind, amount, account=None):
@@ -305,6 +345,64 @@ class Bot:
             })
         await self.send(self.admin_id, "\n".join(lines), markup)
 
+    async def on_amount(self, chat_id, is_dep, text):
+        s = await self.settings()
+        if not s["dep_on" if is_dep else "wit_on"]:
+            await self.clear_state(chat_id)
+            return await self.send(chat_id, "⛔ Temporarily unavailable. Please try again later.")
+        lo, hi = (s["min_dep"], s["max_dep"]) if is_dep else (s["min_wit"], s["max_wit"])
+        amount = parse_amount(text)
+        if amount is None or amount < lo or amount > hi:
+            return await self.ask_amount(chat_id, is_dep, s, error=True)
+        if is_dep:
+            body = (
+                f"<b>💰 {DEP2}</b>\n{LINE}\n"
+                f"💵 <b>Amount:</b> {fmt(amount)} ETB\n\n"
+                f"🏦 <b>Pay to:</b>\n{esc(s['pay_info'])}\n\n"
+                "After paying, send your <b>screenshot</b> or <b>transaction ID</b>.\n"
+                f"{self.how_to()}"
+            )
+            hint = "Screenshot or transaction ID"
+        else:
+            body = (
+                f"<b>💸 {WIT2}</b>\n{LINE}\n"
+                f"💵 <b>Amount:</b> {fmt(amount)} ETB\n\n"
+                "Send the <b>account / phone number</b> where you want to receive your money.\n"
+                f"{self.how_to()}"
+            )
+            hint = "Account or phone number"
+        await self.set_state(chat_id, {"step": "dep2" if is_dep else "wit2", "amount": str(amount)})
+        await self.send(chat_id, body, self.prompt_markup(hint))
+
+    async def on_proof(self, msg, is_dep, amount, text):
+        chat_id = msg["chat"]["id"]
+        uid = msg["from"]["id"]
+        s = await self.settings()
+        if not s["dep_on" if is_dep else "wit_on"]:
+            await self.clear_state(chat_id)
+            return await self.send(chat_id, "⛔ Temporarily unavailable. Please try again later.")
+        if not self.admin_id:
+            print("ADMIN_ID is not set")
+            return await self.send(chat_id, "⚠️ Service unavailable. Please try again later.")
+        if not is_dep and not text.strip():
+            return await self.send(
+                chat_id,
+                "⚠️ Please send text: your account or phone number.",
+                self.prompt_markup("Account or phone number"),
+            )
+
+        await self.send_to_admin(msg, "d" if is_dep else "w", amount, None if is_dep else text.strip())
+        await self.bump("dep_req" if is_dep else "wit_req")
+        await self.clear_state(chat_id)
+        what = "deposit" if is_dep else "withdrawal"
+        await self.send(
+            chat_id,
+            f"<b>📨 REQUEST SENT</b>\n{LINE}\n"
+            f"Your {what} request for <b>{fmt(amount)} ETB</b> is with the admin.\n"
+            "You'll be notified here once it's reviewed ⏳",
+            self.menu_markup(s, self.is_admin(uid)),
+        )
+
     async def on_message(self, msg):
         chat_id = msg["chat"]["id"]
         uid = msg["from"]["id"]
@@ -312,71 +410,38 @@ class Bot:
         reply = (msg.get("reply_to_message") or {}).get("text") or ""
 
         if text.startswith("/start"):
+            await self.clear_state(chat_id)
             return await self.menu(chat_id, uid)
         if text.startswith("/admin"):
+            await self.clear_state(chat_id)
             if self.is_admin(uid):
                 return await self.send_panel(chat_id)
             return await self.menu(chat_id, uid)
 
-        if reply:
-            if SET_MARK in reply and self.is_admin(uid):
-                return await self.save_setting(chat_id, reply, text)
+        state = await self.get_state(chat_id) or {}
+        step = state.get("step")
 
-            # Step 1: amount
-            if DEP1 in reply or WIT1 in reply:
-                is_dep = DEP1 in reply
-                s = await self.settings()
-                if not s["dep_on" if is_dep else "wit_on"]:
-                    return await self.send(chat_id, "⛔ Temporarily unavailable. Please try again later.")
-                lo, hi = (s["min_dep"], s["max_dep"]) if is_dep else (s["min_wit"], s["max_wit"])
-                amount = parse_amount(text)
-                if amount is None or amount < lo or amount > hi:
-                    return await self.ask_amount(chat_id, is_dep, s, error=True)
-                if is_dep:
-                    body = (
-                        f"<b>💰 {DEP2}</b>\n{LINE}\n"
-                        f"💵 <b>Amount:</b> {fmt(amount)} ETB\n\n"
-                        f"🏦 <b>Pay to:</b>\n{esc(s['pay_info'])}\n\n"
-                        "After paying, send your <b>screenshot</b> or <b>transaction ID</b>.\n"
-                        "↩️ Reply to this message."
-                    )
-                    hint = "Screenshot or transaction ID"
-                else:
-                    body = (
-                        f"<b>💸 {WIT2}</b>\n{LINE}\n"
-                        f"💵 <b>Amount:</b> {fmt(amount)} ETB\n\n"
-                        "Send the <b>account / phone number</b> where you want to receive your money.\n"
-                        "↩️ Reply to this message."
-                    )
-                    hint = "Account or phone number"
-                return await self.send(chat_id, body, force_reply(hint))
-
-            # Step 2: proof / account
-            if DEP2 in reply or WIT2 in reply:
-                is_dep = DEP2 in reply
+        # Fallback when storage is off: work out the step from the message being replied to
+        if not step and reply:
+            if SET_MARK in reply:
+                m = re.search(r"\(ref: (\w+)\)", reply)
+                step, state = "set", {"key": m.group(1) if m else None}
+            elif DEP1 in reply:
+                step = "dep1"
+            elif WIT1 in reply:
+                step = "wit1"
+            elif DEP2 in reply or WIT2 in reply:
                 m = re.search(r"Amount: ([\d,.]+) ETB", reply)
-                if not m:
-                    return await self.menu(chat_id, uid)
-                amount = m.group(1).replace(",", "")
-                s = await self.settings()
-                if not s["dep_on" if is_dep else "wit_on"]:
-                    return await self.send(chat_id, "⛔ Temporarily unavailable. Please try again later.")
-                if not self.admin_id:
-                    print("ADMIN_ID is not set")
-                    return await self.send(chat_id, "⚠️ Service unavailable. Please try again later.")
-                if not is_dep and not text.strip():
-                    return await self.send(chat_id, "⚠️ Please reply with text: your account or phone number.", force_reply("Account or phone number"))
+                if m:
+                    step = "dep2" if DEP2 in reply else "wit2"
+                    state = {"amount": m.group(1).replace(",", "")}
 
-                await self.send_to_admin(msg, "d" if is_dep else "w", amount, None if is_dep else text.strip())
-                await self.bump("dep_req" if is_dep else "wit_req")
-                what = "deposit" if is_dep else "withdrawal"
-                return await self.send(
-                    chat_id,
-                    f"<b>📨 REQUEST SENT</b>\n{LINE}\n"
-                    f"Your {what} request for <b>{fmt(amount)} ETB</b> is with the admin.\n"
-                    "You'll be notified here once it's reviewed ⏳",
-                    self.menu_markup(s, self.is_admin(uid)),
-                )
+        if step == "set" and self.is_admin(uid):
+            return await self.save_setting(chat_id, state.get("key"), text)
+        if step in ("dep1", "wit1"):
+            return await self.on_amount(chat_id, step == "dep1", text)
+        if step in ("dep2", "wit2") and state.get("amount"):
+            return await self.on_proof(msg, step == "dep2", state["amount"], text)
 
         await self.menu(chat_id, uid)
 
@@ -393,8 +458,9 @@ class Bot:
             await self.answer(q)
             return await self.ask_amount(chat_id, is_dep, s)
 
-        if data == "menu":
+        if data in ("menu", "cancel"):
             await self.answer(q)
+            await self.clear_state(chat_id)
             text, markup = self.menu_view(await self.settings(), uid)
             return await self.edit(q, text, markup)
 
@@ -428,6 +494,8 @@ class Bot:
             if not self.is_admin(uid):
                 return await self.answer(q, "Admins only", True)
             parts = data.split(":")
+            if parts[1] != "set":
+                await self.clear_state(chat_id)
             s = await self.settings()
             if parts[1] in ("tdep", "twit"):
                 key = "dep_on" if parts[1] == "tdep" else "wit_on"
