@@ -115,7 +115,7 @@ class Bot:
         return await self.tg("answerCallbackQuery", payload)
 
     async def kv_get(self, key, default):
-        if not self.kv:
+        if self.kv is None:
             return default
         try:
             raw = await self.kv.get(key)
@@ -129,7 +129,7 @@ class Bot:
         return default
 
     async def kv_set(self, key, value):
-        if not self.kv:
+        if self.kv is None:
             return False
         try:
             await self.kv.put(key, json.dumps(value))
@@ -146,7 +146,7 @@ class Bot:
 
     # ---------- Conversation state (so users can just type) ----------
     async def get_state(self, cid):
-        if not self.kv:
+        if self.kv is None:
             return None
         try:
             raw = await self.kv.get(f"state:{cid}")
@@ -157,7 +157,7 @@ class Bot:
         return None
 
     async def set_state(self, cid, st):
-        if not self.kv:
+        if self.kv is None:
             return
         try:
             opts = to_js({"expirationTtl": 3600}, dict_converter=js.Object.fromEntries)
@@ -166,7 +166,7 @@ class Bot:
             print("state write error", traceback.format_exc())
 
     async def clear_state(self, cid):
-        if not self.kv:
+        if self.kv is None:
             return
         try:
             await self.kv.delete(f"state:{cid}")
@@ -175,12 +175,12 @@ class Bot:
 
     def prompt_markup(self, placeholder):
         # With storage the bot remembers the step, so no "reply" is needed.
-        if self.kv:
+        if self.kv is not None:
             return {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "cancel"}]]}
         return force_reply(placeholder)
 
     def how_to(self):
-        return "Just type it below 👇" if self.kv else "↩️ Reply to this message."
+        return "Just type it below 👇" if self.kv is not None else "↩️ Reply to this message."
 
     # ---------- User menu ----------
     def menu_markup(self, s, admin=False):
@@ -220,7 +220,7 @@ class Bot:
 
     # ---------- Admin panel ----------
     def panel_view(self, s):
-        warn = "" if self.kv else "⚠️ <b>Storage not connected</b> — settings can't be saved.\n\n"
+        warn = "" if self.kv is not None else "⚠️ <b>Storage not connected</b> — settings can't be saved.\n\n"
         support = f"@{esc(s['support'])}" if s["support"] else "not set"
         text = (
             f"<b>⚙️ ADMIN PANEL</b>\n{LINE}\n{warn}"
@@ -269,13 +269,13 @@ class Bot:
                 f"Requests: {st[f'{p}_req']}  ·  ✅ {st[f'{p}_ok']}  ·  ❌ {st[f'{p}_no']}  ·  ⏳ {pending}"
             )
         text = f"<b>📊 STATS</b>\n{LINE}\n{block('💰 Deposits', 'dep')}\n\n{block('💸 Withdrawals', 'wit')}"
-        if not self.kv:
+        if self.kv is None:
             text += "\n\n⚠️ <i>Storage not connected — stats aren't being recorded.</i>"
         markup = {"inline_keyboard": [[{"text": "⬅️ Back", "callback_data": "adm:home"}]]}
         return text, markup
 
     async def bump(self, key):
-        if not self.kv:
+        if self.kv is None:
             return
         st = await self.kv_get("stats", dict(STATS0))
         st[key] = st.get(key, 0) + 1
