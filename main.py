@@ -33,6 +33,7 @@ WIT2 = "Withdraw · Step 2 of 3"
 WIT3 = "Withdraw · Step 3 of 3"
 SET_MARK = "Admin setting"
 
+SUPPORT_USER = "Ethio_Agent_1xbet"  # support / admin username (without @)
 MAX_SAVED = 3  # saved 1xBet IDs / withdraw accounts per user
 MAX_TEXT = 1500  # max length of welcome / payment text
 MAX_REQ_HOUR = 5  # requests (deposit + withdraw) one user can send per hour
@@ -58,7 +59,7 @@ DEFAULTS = {
     "max_dep": 100000,
     "pay_info": "Ask the admin for payment details.",
     "welcome": "Request a deposit or withdrawal in just a few taps.",
-    "support": "",
+    "support": SUPPORT_USER,
 }
 STATS0 = {"dep_req": 0, "dep_ok": 0, "dep_no": 0, "wit_req": 0, "wit_ok": 0, "wit_no": 0}
 
@@ -516,6 +517,7 @@ class Bot:
                 await self.notify_decision(st["uid"], st["kind"], st["ref"], False, None)
         except Exception:
             print("state delete error", traceback.format_exc())
+
     def prompt_markup(self, placeholder):
         # With storage the bot remembers the step, so no "reply" is needed.
         if self.kv is not None:
@@ -542,6 +544,7 @@ class Bot:
         if len(_SEEN) > 50000:
             _SEEN.clear()
         _SEEN.add(uid)
+
     async def list_users(self):
         """Everyone who talked to the bot, except banned users."""
         ids = await self._list_ids("user:")
@@ -662,19 +665,28 @@ class Bot:
             )
         rec["h"] = (await self.get_hist(uid) + [{"r": rid, "k": kind, "a": ref, "s": "p", "t": now}])[-HIST_MAX:]
         await self.usave(uid)
+
     # ---------- User menu ----------
+    def support_url(self, s):
+        return f"https://t.me/{s.get('support') or SUPPORT_USER}"
+
     def menu_markup(self, s, admin=False):
-        rows = [[
-            {"text": "Deposit", "callback_data": "deposit"},
-            {"text": "Withdraw", "callback_data": "withdraw"},
-        ]]
-        row2 = [{"text": "My requests", "callback_data": "hist"}]
-        if s.get("support"):
-            row2.append({"text": "Support", "url": f"https://t.me/{s['support']}"})
-        rows.append(row2)
+        rows = [
+            [
+                {"text": "Deposit", "callback_data": "deposit"},
+                {"text": "Withdraw", "callback_data": "withdraw"},
+            ],
+            [{"text": "Contact support", "url": self.support_url(s)}],
+        ]
         if admin:
             rows.append([{"text": "Admin panel", "callback_data": "adm:home"}])
         return {"inline_keyboard": rows}
+
+    def locked_markup(self, s, uid):
+        """Keyboard for screens shown while the user's request is waiting: no Deposit / Withdraw."""
+        if self.is_admin(uid):
+            return self.menu_markup(s, True)
+        return {"inline_keyboard": [[{"text": "Contact support", "url": self.support_url(s)}]]}
 
     def menu_view(self, s, uid):
         text = f"<b>Welcome</b>\n\n{s['welcome']}"  # already Telegram HTML
@@ -971,6 +983,7 @@ class Bot:
         bans = await self.bans(fresh=True)
         items = sorted(bans.items(), key=lambda it: -int((it[1] or {}).get("t") or 0) if isinstance(it[1], dict) else 0)
         return len(items), [(i, (v.get("n") or "") if isinstance(v, dict) else "") for i, v in items[:BAN_SHOW]]
+
     async def bans_view(self, note=""):
         total, shown = await self.list_banned()
         if shown:
@@ -1069,7 +1082,9 @@ class Bot:
     async def notify_decision(self, user_id, kind, ref, approved, reason):
         what = "Deposit" if kind == "d" else "Withdrawal"
         if approved:
-            title, note = f"{what} approved", "Thank you."
+            title = f"{what} approved"
+            note = ("Thank you.\n\n"
+                    "If you haven't received it, tap the <b>Contact support</b> button below.")
         else:
             title = f"{what} rejected"
             note = f"<b>Reason</b>\n<blockquote>{esc(reason)}</blockquote>\n\n" if reason else ""
@@ -1079,11 +1094,13 @@ class Bot:
         else:
             info = card([("Withdraw code", f"<code>{esc(str(ref))}</code>")])
         s = await self.settings()
-        await self.send(
-            user_id,
-            f"<b>{title}</b>\n\n{info}\n\n{note}",
-            self.menu_markup(s, self.is_admin(user_id)),
-        )
+        markup = self.menu_markup(s, self.is_admin(user_id))
+        if approved:
+            markup = {"inline_keyboard": [
+                [{"text": "Contact support", "url": self.support_url(s)}],
+                [{"text": "Main menu", "callback_data": "menu"}],
+            ]}
+        await self.send(user_id, f"<b>{title}</b>\n\n{info}\n\n{note}", markup)
 
     async def finish_reject(self, chat_id, st, reason):
         """Admin gave a reason (or skipped): tell the user."""
@@ -1109,7 +1126,7 @@ class Bot:
         p = (await self.urec(uid)).get("p")
         return bool(p) and time.time() - int(p[1]) < PEND_TTL
 
-    # ---------- Request history ("My requests") ----------
+    # ---------- Request history ("My requests", reachable with /history) ----------
     async def hist_update(self, uid, rid, status):
         """The admin decided: show it in the user's history and free the one-open-request lock."""
         if self.kv is None or not rid:
@@ -1148,7 +1165,7 @@ class Bot:
             "<b>Help</b>\n",
             "<b>Deposit</b> · send the amount, your 1xBet ID, then your payment proof.",
             "<b>Withdraw</b> · send your 4-character withdraw code, then where to receive the money.",
-            "<b>My requests</b> · your latest requests and their status.\n",
+            "<b>Support</b> · contact the admin if you have a problem.\n",
             "/start · main menu",
             "/history · your requests",
             "/help · this message",
@@ -1215,6 +1232,9 @@ class Bot:
             f"{head(DEP3)}\n\n{note}"
             f"{card([('Amount', f'<b>{fmt(amount)} ETB</b>'), ('1xBet ID', f'<code>{xid}</code>')])}\n\n"
             f"<b>Pay to</b>\n{pay_block}\n\n"
+            "⚠️ <b>Important:</b> send the money from the <b>same payment method</b> you pay to. "
+            "If you pay to CBE, send from your CBE account; to Telebirr, send from Telebirr; "
+            "to CBE Birr, send from CBE Birr. Payments from a different method may be rejected.\n\n"
             "After paying, send a <b>screenshot</b> or the <b>transaction ID</b>.\n"
             f"{self.how_to()}"
         )
@@ -1253,7 +1273,7 @@ class Bot:
             )
         if await self.has_open_request(uid):
             await self.clear_state(chat_id)
-            return await self.ui(chat_id, OPEN_MSG, self.menu_markup(s, self.is_admin(uid)))
+            return await self.ui(chat_id, OPEN_MSG, self.locked_markup(s, uid))
 
         # the proof must be a screenshot / file, or a transaction ID that looks real
         ident = proof_ident(msg)
@@ -1283,7 +1303,7 @@ class Bot:
             "<b>Request sent</b>\n\n"
             f"{card([('Deposit', f'<b>{fmt(amount)} ETB</b>'), ('1xBet ID', f'<code>{esc(xid)}</code>')])}\n\n"
             "The admin will review it. You'll be notified here.",
-            self.menu_markup(s, self.is_admin(uid)),
+            self.locked_markup(s, uid),
         )
 
     # ---------- Withdraw flow: code -> method / saved account -> account ----------
@@ -1329,7 +1349,11 @@ class Bot:
             "Tap a saved account to send instantly, or pick a method below to use a new one."
             if saved else "Choose where you want to receive your money."
         )
-        text = f"{head(WIT2)}\n\n{card([('Withdraw code', esc(code))])}\n\n{hint}"
+        text = (
+            f"{head(WIT2)}\n\n{card([('Withdraw code', esc(code))])}\n\n{hint}\n\n"
+            "⚠️ Receive your money on the same payment method you used to deposit "
+            "(CBE → CBE, Telebirr → Telebirr, CBE Birr → CBE Birr)."
+        )
         await self.step(chat_id, text, {"inline_keyboard": rows}, {"step": "wit2", "code": code})
 
     async def ask_wit_account(self, chat_id, code, mkey, error=False):
@@ -1365,13 +1389,13 @@ class Bot:
             )
         if await self.has_open_request(user["id"]):
             await self.clear_state(chat_id)
-            return await self.ui(chat_id, OPEN_MSG, self.menu_markup(s, self.is_admin(user["id"])))
+            return await self.ui(chat_id, OPEN_MSG, self.locked_markup(s, user["id"]))
         tk = hkey("wc:", code) if self.kv is not None else None  # case sensitive
         if tk and await self.kv_exists(tk):
             await self.clear_state(chat_id)
             return await self.ui(
                 chat_id, "This code is already waiting for the admin's review.",
-                self.menu_markup(s, self.is_admin(user["id"])),
+                self.locked_markup(s, user["id"]),
             )
 
         rid, delivered = await self.send_to_admin(
@@ -1387,7 +1411,7 @@ class Bot:
             "<b>Request sent</b>\n\n"
             f"{card([('Withdraw code', esc(code)), (METHODS[mkey], f'<code>{esc(account)}</code>')])}\n\n"
             "The admin will review it. You'll be notified here.",
-            self.menu_markup(s, self.is_admin(user["id"])),
+            self.locked_markup(s, user["id"]),
         )
 
     async def on_wit_account(self, msg, code, mkey, text):
@@ -1477,7 +1501,6 @@ class Bot:
                         "code": cm.group(1),
                         "method": LABEL_TO_KEY[mm.group(1)],
                     }
-
 
         # Keep the chat tidy: remove typed answers (the payment proof stays)
         if self.kv is not None and step in ("set", "dep1", "dep2", "wit1", "wit2", "wit3"):
