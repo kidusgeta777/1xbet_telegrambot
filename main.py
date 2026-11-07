@@ -1226,6 +1226,17 @@ class Bot:
         if step == "wit3" and state.get("code"):
             return await self.on_wit_account(msg, state["code"], state.get("method"), text)
 
+        if (msg.get("photo") or msg.get("document")) and not step:
+            if msg.get("media_group_id"):  # several photos at once: the first one already got an answer
+                return
+            s = await self.settings()
+            return await self.ui(
+                chat_id,
+                "<b>Session expired</b>\n\nI couldn't match this file to a request. "
+                "Tap <b>Deposit</b>, then send the receipt when asked.",
+                self.menu_markup(s, self.is_admin(uid)),
+            )
+
         await self.menu(chat_id, uid)
 
     async def on_callback(self, q):
@@ -1429,6 +1440,27 @@ class Default(WorkerEntrypoint):
         ]})
         return Response(f"setWebhook: {hook}\nsetMyCommands: {cmds}")
 
+    async def report_error(self, update, tb):
+        """Never stay silent: tell the user to retry and show the first admin what broke."""
+        try:
+            bot = Bot(self.env)
+            m = (update or {}).get("message") or {}
+            q = (update or {}).get("callback_query") or {}
+            chat_id = (m.get("chat") or {}).get("id") or ((q.get("message") or {}).get("chat") or {}).get("id")
+            who = m.get("from") or q.get("from") or {}
+            if q.get("id"):
+                await bot.answer(q)
+            short = "\n".join(tb.strip().splitlines()[-4:])[-700:]
+            if chat_id:
+                await bot.send(
+                    chat_id,
+                    "<b>Something went wrong</b>\n\nPlease send /start and try again. The admin has been told.",
+                )
+            for aid in bot.admins[:1]:
+                await bot.send(aid, f"<b>Bot error</b>\n\nUser <code>{who.get('id', '?')}</code>\n<pre>{esc(short)}</pre>")
+        except Exception:
+            print("report error failed", traceback.format_exc())
+
     async def fetch(self, request):
         if request.method == "GET":
             return await self.setup(request)
@@ -1440,6 +1472,7 @@ class Default(WorkerEntrypoint):
             got = request.headers.get("X-Telegram-Bot-Api-Secret-Token") or ""
             if not hmac.compare_digest(str(got).encode(), str(secret).encode()):
                 return Response("Forbidden", status=403)
+        update = None
         try:
             update = await request.json()
             bot = Bot(self.env)
@@ -1453,5 +1486,7 @@ class Default(WorkerEntrypoint):
                 await bot.touch(q["from"]["id"])
                 await bot.on_callback(q)
         except Exception:
-            print("ERROR:", traceback.format_exc())
+            tb = traceback.format_exc()
+            print("ERROR:", tb)
+            await self.report_error(update, tb)
         return Response("OK")
