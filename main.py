@@ -37,6 +37,7 @@ MAX_REQ_HOUR = 5  # requests (deposit + withdraw) one user can send per hour
 HIST_MAX = 10  # requests kept in "My requests"
 REQ_TTL = 90 * 86400  # how long Approve / Reject buttons stay valid
 TXN_TTL = 180 * 86400  # how long a used receipt / withdraw code stays blocked
+DEBUG_PROOF = True  # step-by-step "LOG ·" messages about screenshots, sent to the first admin only. False = off
 
 # short key (used in callback_data) -> label
 METHODS = {"c": "CBE", "t": "Telebirr", "b": "CBE Birr"}
@@ -327,6 +328,15 @@ class Bot:
         if resp.status != 200:
             print(method, resp.status, body)
         return body
+
+    async def dbg(self, text):
+        """Debug line for the first admin only (never the user). Plain text, never raises."""
+        if not DEBUG_PROOF or not self.admins:
+            return
+        try:
+            await self.tg("sendMessage", {"chat_id": self.admins[0], "text": ("LOG · " + text)[:900]})
+        except Exception:
+            print("dbg error", traceback.format_exc())
 
     async def tg_text(self, method, payload):
         """sendMessage / editMessageText. If Telegram can't parse the HTML, retry as plain text
@@ -807,14 +817,23 @@ class Bot:
         ]]}
         msgs = []
         for aid in self.admins:
+            is_file = bool(proof and (proof.get("photo") or proof.get("document")))
             if kind == "d" and proof:
-                await self.tg("copyMessage", {
+                fwd = {
                     "chat_id": aid,
                     "from_chat_id": proof["chat"]["id"],
                     "message_id": proof["message_id"],
-                })
+                }
+                cd = as_json(await self.tg("forwardMessage", fwd))  # real forward of the user's message
+                if not (cd and cd.get("ok")):
+                    cd = as_json(await self.tg("copyMessage", fwd))  # fallback if forwarding is refused
+                if is_file:
+                    good = bool(cd and cd.get("ok"))
+                    await self.dbg(f"forward of file to admin {aid}: ok={good}" + ("" if good else f" {str(cd)[:300]}"))
             d = as_json(await self.send(aid, f"<b>{title}</b>\n\n{card(rows)}", markup))
             mid = ((d or {}).get("result") or {}).get("message_id")
+            if is_file:
+                await self.dbg(f"request card to admin {aid}: message_id={mid}" + ("" if mid else f" {str(d)[:300]}"))
             if mid:
                 msgs.append([aid, mid])
         # the record lets us ignore a second tap and update every admin's copy
@@ -990,6 +1009,21 @@ class Bot:
         await self.show_pay_step(chat_id, amount, xid, s)
 
     async def on_proof(self, msg, amount, xid):
+        is_file = bool(msg.get("photo") or msg.get("document"))
+        try:
+            if is_file:
+                await self.dbg(f"on_proof start: amount={amount}, xid={xid}")
+            result = await self._on_proof(msg, amount, xid)
+            if is_file:
+                await self.dbg("on_proof finished")
+            return result
+        except Exception:
+            if is_file:
+                await self.dbg("on_proof EXCEPTION:\n" + traceback.format_exc()[-700:])
+            raise
+
+    async def _on_proof(self, msg, amount, xid):
+        is_file = bool(msg.get("photo") or msg.get("document"))
         chat_id = msg["chat"]["id"]
         uid = msg["from"]["id"]
         s = await self.settings()
@@ -1002,6 +1036,8 @@ class Bot:
         if not xid:
             return await self.ask_xbet(chat_id, amount)  # safety net
         if not await self.rate_ok(uid):
+            if is_file:
+                await self.dbg("stopped: spam limit")
             await self.clear_state(chat_id)
             return await self.ui(
                 chat_id, "Too many requests. Please try again later.",
@@ -1010,6 +1046,8 @@ class Bot:
 
         # the proof must be a screenshot / file, or a transaction ID that looks real
         ident = proof_ident(msg)
+        if is_file:
+            await self.dbg(f"proof id: {ident}")
         if not ident:
             return await self.show_pay_step(
                 chat_id, amount, xid, s, error="Send a screenshot or a valid transaction ID.",
@@ -1017,12 +1055,17 @@ class Bot:
         tk = None
         if self.kv is not None:
             tk = hkey("txn:", ident)
-            if await self.kv_exists(tk):
+            dup = await self.kv_exists(tk)
+            if is_file:
+                await self.dbg(f"duplicate receipt: {dup}")
+            if dup:
                 return await self.show_pay_step(
                     chat_id, amount, xid, s, error="This receipt was already used. Send a different one.",
                 )
 
         rid = await self.send_to_admin(msg["from"], "d", amount, proof=msg, xid=xid, tk=tk)
+        if is_file:
+            await self.dbg(f"request {rid} created")
         if tk:
             await self.kv_set(tk, 1, TXN_TTL)
         await self.record_xid(chat_id, xid)
@@ -1225,6 +1268,12 @@ class Bot:
                         "code": cm.group(1),
                         "method": LABEL_TO_KEY[mm.group(1)],
                     }
+
+        if DEBUG_PROOF and (msg.get("photo") or msg.get("document")):
+            await self.dbg(
+                f"file received from {uid}: step={step!r}, photo={bool(msg.get('photo'))}, "
+                f"document={bool(msg.get('document'))}, state keys={sorted(state.keys()) if state else []}"
+            )
 
         # Keep the chat tidy: remove typed answers (the payment proof stays)
         if self.kv is not None and step in ("set", "dep1", "dep2", "wit1", "wit2", "wit3"):
