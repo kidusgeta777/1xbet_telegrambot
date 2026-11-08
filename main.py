@@ -688,6 +688,16 @@ class Bot:
             return self.menu_markup(s, True)
         return {"inline_keyboard": [[{"text": "Contact support", "url": self.support_url(s)}]]}
 
+    def sent_markup(self, s, uid):
+        """Keyboard under 'Request sent': no buttons for users (admins keep their menu)."""
+        return self.menu_markup(s, True) if self.is_admin(uid) else None
+
+    async def user_markup(self, s, uid):
+        """Main keyboard, or support-only while the user has a request waiting."""
+        if await self.has_open_request(uid):
+            return self.locked_markup(s, uid)
+        return self.menu_markup(s, self.is_admin(uid))
+
     def menu_view(self, s, uid):
         text = f"<b>Welcome</b>\n\n{s['welcome']}"  # already Telegram HTML
         return text, self.menu_markup(s, self.is_admin(uid))
@@ -695,6 +705,9 @@ class Bot:
     async def menu(self, chat_id, uid=None):
         s = await self.settings()
         text, markup = self.menu_view(s, uid)
+        if await self.has_open_request(uid):  # one request at a time: Deposit / Withdraw hidden
+            text += "\n\n<i>Your request is waiting for the admin's review.</i>"
+            markup = self.locked_markup(s, uid)
         await self.ui(chat_id, text, markup)
 
     # ---------- Admin panel ----------
@@ -1313,8 +1326,9 @@ class Bot:
             chat_id,
             "<b>Request sent</b>\n\n"
             f"{card([('Deposit', f'<b>{fmt(amount)} ETB</b>'), ('1xBet ID', f'<code>{esc(xid)}</code>')])}\n\n"
-            "The admin will review it. You'll be notified here.",
-            self.locked_markup(s, uid),
+            "Your request has been submitted. Please wait while the admin reviews and processes it. "
+            "You'll be notified here.",
+            self.sent_markup(s, uid),
         )
 
     # ---------- Withdraw flow: code -> method / saved account -> account ----------
@@ -1421,8 +1435,9 @@ class Bot:
             chat_id,
             "<b>Request sent</b>\n\n"
             f"{card([('Withdraw code', esc(code)), (METHODS[mkey], f'<code>{esc(account)}</code>')])}\n\n"
-            "The admin will review it. You'll be notified here.",
-            self.locked_markup(s, user["id"]),
+            "Your request has been submitted. Please wait while the admin reviews and processes it. "
+            "You'll be notified here.",
+            self.sent_markup(s, user["id"]),
         )
 
     async def on_wit_account(self, msg, code, mkey, text):
@@ -1540,7 +1555,7 @@ class Bot:
                 chat_id,
                 "<b>Session expired</b>\n\nI couldn't match this file to a request. "
                 "Tap <b>Deposit</b>, then send the receipt when asked.",
-                self.menu_markup(s, self.is_admin(uid)),
+                await self.user_markup(s, uid),
             )
 
         await self.menu(chat_id, uid)
@@ -1631,8 +1646,7 @@ class Bot:
         if data in ("menu", "cancel"):
             await self.answer(q)
             await self.clear_state(chat_id)
-            text, markup = self.menu_view(await self.settings(), uid)
-            return await self.ui(chat_id, text, markup)
+            return await self.menu(chat_id, uid)
 
         if data == "hist":
             await self.answer(q)
