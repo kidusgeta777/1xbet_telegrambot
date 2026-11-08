@@ -6,8 +6,8 @@
 #                   Open  https://<your-worker>/setup?key=<WEBHOOK_SECRET>  once to register the webhook.
 # KV binding named SETTINGS (needed for settings, stats, conversation state, broadcast, saved accounts,
 # request history, duplicate-receipt check, reject reasons, spam limit, one-open-request lock, bans).
-# Keys: settings, stats, bans (one key for all banned users), user:<id> (ONE record per user: rate limit,
-# open request, saved IDs / accounts, history), state:<chat>, req:<id>, txn:<hash> / wc:<hash> (used receipts / codes).
+# Keys: settings, stats, bans, open (index of open requests), user:<id>, state:<chat>, req:<id>,
+# txn:<hash> / wc:<hash> (used receipts / codes).
 import asyncio
 import hashlib
 import hmac
@@ -37,16 +37,17 @@ SUPPORT_USER = "Ethio_Agent_1xbet"  # support / admin username (without @)
 MAX_SAVED = 3  # saved 1xBet IDs / withdraw accounts per user
 MAX_TEXT = 1500  # max length of welcome / payment text
 MAX_REQ_HOUR = 5  # requests (deposit + withdraw) one user can send per hour
-HIST_MAX = 10  # requests kept in "My requests"
+HIST_MAX = 10  # requests kept in the user's record
 REQ_TTL = 90 * 86400  # how long Approve / Reject buttons stay valid
 TXN_TTL = 180 * 86400  # how long a used receipt / withdraw code stays blocked
 PEND_TTL = 86400  # one open request per user; the lock frees itself after this long if no admin answers
 BAN_SHOW = 20  # banned users listed (with Unban buttons) on the Bans screen
+OPEN_SHOW = 8  # open requests listed on the admin "Open requests" screen
 OPEN_MSG = "You already have a request waiting for the admin. Please wait for the reply before sending another."
 BAN_MSG = "You are not allowed to use this bot."
-CACHE_TTL = 30  # seconds settings and the ban list are kept in memory (a change by an admin reaches every instance within this time)
-_CACHE = {}  # name -> (valid until, value). Lives as long as the running instance and is shared by all updates it handles
-_SEEN = set()  # users this instance has already registered, so they are not looked up again
+CACHE_TTL = 30  # seconds settings and the ban list are kept in memory
+_CACHE = {}  # name -> (valid until, value)
+_SEEN = set()  # users this instance has already registered
 
 # short key (used in callback_data) -> label
 METHODS = {"c": "CBE", "t": "Telebirr", "b": "CBE Birr"}
@@ -61,7 +62,8 @@ DEFAULTS = {
     "welcome": "Request a deposit or withdrawal in just a few taps.",
     "support": SUPPORT_USER,
 }
-STATS0 = {"dep_req": 0, "dep_ok": 0, "dep_no": 0, "wit_req": 0, "wit_ok": 0, "wit_no": 0}
+STATS0 = {"dep_req": 0, "dep_ok": 0, "dep_no": 0, "dep_cl": 0,
+          "wit_req": 0, "wit_ok": 0, "wit_no": 0, "wit_cl": 0}
 
 # key -> (label, type). Type "rich" = text that keeps formatting (stored as Telegram HTML).
 SETTING_INFO = {
@@ -278,8 +280,7 @@ def hkey(prefix, value):
 
 
 def _file_id(msg, key):
-    """Unique id of the photo / file. Works whether Telegram's data arrives as plain Python
-    or as JavaScript objects, and never raises (falls back to a random id)."""
+    """Unique id of the photo / file. Never raises (falls back to a random id)."""
     try:
         v = msg.get(key)
         if key == "photo":
@@ -321,10 +322,9 @@ class Bot:
         self.secret = getattr(env, "WEBHOOK_SECRET", None)
         self.kv = getattr(env, "SETTINGS", None)
         self.pm = None  # id of the bot message currently on screen (edited in place)
-        # read once per update, then reused (one Bot object handles exactly one update)
         self._u = {}  # user id -> record
         self._fresh = set()  # records that were not stored yet (new user / old layout)
-        self._ro = set()  # records we could not read: never written back, so nothing is overwritten
+        self._ro = set()  # records we could not read: never written back
         self._state = {}  # chat id -> state as stored (None = known to be empty)
 
     # ---------- Telegram + storage helpers ----------
@@ -344,8 +344,7 @@ class Bot:
         return body
 
     async def tg_text(self, method, payload):
-        """sendMessage / editMessageText. If Telegram can't parse the HTML, retry as plain text
-        so one bad formatting never makes the bot go silent."""
+        """sendMessage / editMessageText. If Telegram can't parse the HTML, retry as plain text."""
         body = await self.tg(method, payload)
         d = as_json(body)
         if d and not d.get("ok") and "parse entities" in str(d.get("description", "")).lower():
@@ -381,7 +380,6 @@ class Bot:
             if d and (d.get("ok") or "not modified" in str(d.get("description", "")).lower()):
                 return
         elif self.pm:
-            # a reply prompt can't be made by editing, so drop the old message and send a fresh one
             await self.delete(chat_id, self.pm)
         d = as_json(await self.send(chat_id, text, markup))
         self.pm = ((d or {}).get("result") or {}).get("message_id")
@@ -438,7 +436,7 @@ class Bot:
             return False
 
     async def settings(self):
-        """Almost every update needs the settings and they rarely change, so they are kept in memory."""
+        """Settings rarely change, so they are kept in memory."""
         hit = _CACHE.get("settings")
         if hit and hit[0] > time.time():
             return dict(hit[1])
@@ -449,7 +447,7 @@ class Bot:
             stored = json.loads(raw) if isinstance(raw, str) else {}
         except Exception:
             print("settings read error", traceback.format_exc())
-            return dict(DEFAULTS)  # a failed read is not remembered
+            return dict(DEFAULTS)
         s = {**DEFAULTS, **stored} if isinstance(stored, dict) else dict(DEFAULTS)
         _CACHE["settings"] = (time.time() + CACHE_TTL, s)
         return dict(s)
@@ -457,7 +455,7 @@ class Bot:
     async def save_settings(self, s):
         ok = await self.kv_set("settings", s)
         if ok:
-            _CACHE["settings"] = (time.time() + CACHE_TTL, dict(s))  # this instance sees it at once
+            _CACHE["settings"] = (time.time() + CACHE_TTL, dict(s))
         return ok
 
     def is_admin(self, uid):
@@ -468,7 +466,7 @@ class Bot:
         if self.kv is None:
             return None
         k = str(cid)
-        if k in self._state:  # already read in this update
+        if k in self._state:
             return self._state[k]
         try:
             raw = await self.kv.get(f"state:{cid}")
@@ -484,7 +482,7 @@ class Bot:
             return
         k = str(cid)
         if k in self._state and self._state[k] == st:
-            return  # same step again (e.g. after a wrong answer): nothing new to write
+            return
         try:
             opts = to_js({"expirationTtl": 3600}, dict_converter=js.Object.fromEntries)
             await self.kv.put(f"state:{cid}", json.dumps(st), opts)
@@ -502,15 +500,15 @@ class Bot:
             if k in self._state:
                 st = self._state[k]
                 if not st:
-                    return  # known to be empty: nothing to delete
+                    return
             elif self.is_admin(cid):
-                raw = await self.kv.get(f"state:{cid}")  # only admins can be in the "reject reason" step
+                raw = await self.kv.get(f"state:{cid}")
                 st = json.loads(raw) if isinstance(raw, str) else None
                 if not st:
                     self._state[k] = None
                     return
             else:
-                st = None  # a normal user has nothing that needs reading first
+                st = None
             await self.kv.delete(f"state:{cid}")
             self._state[k] = None
             if notify and st and st.get("step") == "reason":
@@ -519,7 +517,6 @@ class Bot:
             print("state delete error", traceback.format_exc())
 
     def prompt_markup(self, placeholder):
-        # With storage the bot remembers the step, so no "reply" is needed.
         if self.kv is not None:
             return {"inline_keyboard": [[{"text": "Cancel", "callback_data": "cancel"}]]}
         return force_reply(placeholder)
@@ -529,8 +526,6 @@ class Bot:
 
     # ---------- Users (for broadcast) ----------
     async def touch(self, uid):
-        """Remember every user who talks to the bot (their record is what the broadcast list is made of).
-        A user this instance has already registered costs nothing."""
         uid = str(uid)
         if self.kv is None or not uid or uid in _SEEN:
             return
@@ -539,7 +534,7 @@ class Bot:
             return
         if uid in self._fresh:
             await self.usave(uid)
-            if uid in self._fresh:  # could not be saved: try again next time
+            if uid in self._fresh:
                 return
         if len(_SEEN) > 50000:
             _SEEN.clear()
@@ -554,7 +549,6 @@ class Bot:
         return [i for i in ids if i not in bans]
 
     async def _list_ids(self, prefix):
-        """Ids of every KV key that starts with prefix (e.g. 'user:' -> user ids)."""
         ids, cursor = [], None
         if self.kv is None:
             return ids
@@ -574,8 +568,6 @@ class Bot:
         return ids
 
     # ---------- One record per user (user:<id>) ----------
-    # Rate limit, open request, saved 1xBet IDs / withdraw accounts (max 3 each) and request history all live
-    # in this one key: one read and one write per update instead of one per item.
     async def _saved(self, key):
         items = await self.kv_get(key, [])
         return items if isinstance(items, list) else []
@@ -595,13 +587,13 @@ class Bot:
             data = json.loads(raw) if isinstance(raw, str) else None
         except Exception:
             print("user read error", traceback.format_exc())
-            self._ro.add(uid)  # content unknown: usable for this update, but never written over the real one
+            self._ro.add(uid)
             return rec
         if isinstance(data, dict) and data.get("v") == 1:
             self._u[uid] = rec = data
             return rec
         self._fresh.add(uid)
-        if data is not None:  # registered by an older version, which kept these in separate keys
+        if data is not None:
             rec["x"], rec["a"], rec["h"] = await asyncio.gather(
                 *[self._saved(f"{p}:{uid}") for p in ("xids", "accts", "hist")]
             )
@@ -628,8 +620,7 @@ class Bot:
 
     @staticmethod
     def _remember(items, new, same):
-        """Known item -> use count +1. New item -> added, or replaces the least-used one
-        (oldest use breaks a tie) when MAX_SAVED are already stored."""
+        """Known item -> use count +1. New item -> added, or replaces the least-used one."""
         now = int(time.time())
         for it in items:
             if same(it):
@@ -653,7 +644,7 @@ class Bot:
         if not self.is_admin(uid):
             n, t = rec.get("rl") or [0, 0]
             rec["rl"] = [1, now] if now - int(t) >= 3600 else [int(n) + 1, int(t)]
-            if delivered:  # no lock if no admin got the card, or the user could not try again
+            if delivered:
                 rec["p"] = [rid, now]
         if xid:
             rec["x"] = self._remember(await self.get_xids(uid), {"a": xid}, lambda a: a["a"] == xid)
@@ -666,6 +657,23 @@ class Bot:
         rec["h"] = (await self.get_hist(uid) + [{"r": rid, "k": kind, "a": ref, "s": "p", "t": now}])[-HIST_MAX:]
         await self.usave(uid)
 
+    # ---------- Open-requests index (one small key, so listing never needs many reads) ----------
+    async def open_all(self):
+        idx = await self.kv_get("open", {})
+        cut = int(time.time()) - REQ_TTL
+        return {r: v for r, v in idx.items() if isinstance(v, dict) and int(v.get("t", 0)) > cut}
+
+    async def open_add(self, rid, item):
+        idx = await self.open_all()
+        idx[rid] = item
+        await self.kv_set("open", idx)
+
+    async def open_drop(self, rid):
+        idx = await self.open_all()
+        if rid in idx:
+            del idx[rid]
+            await self.kv_set("open", idx)
+
     # ---------- User menu ----------
     def support_url(self, s):
         return f"https://t.me/{s.get('support') or SUPPORT_USER}"
@@ -676,6 +684,7 @@ class Bot:
                 {"text": "Deposit", "callback_data": "deposit"},
                 {"text": "Withdraw", "callback_data": "withdraw"},
             ],
+            [{"text": "My request", "callback_data": "hist"}],
             [{"text": "Contact support", "url": self.support_url(s)}],
         ]
         if admin:
@@ -686,26 +695,30 @@ class Bot:
         """Keyboard for screens shown while the user's request is waiting: no Deposit / Withdraw."""
         if self.is_admin(uid):
             return self.menu_markup(s, True)
-        return {"inline_keyboard": [[{"text": "Contact support", "url": self.support_url(s)}]]}
+        return {"inline_keyboard": [
+            [{"text": "My request", "callback_data": "hist"}],
+            [{"text": "Contact support", "url": self.support_url(s)}],
+        ]}
 
     def sent_markup(self, s, uid):
-        """Keyboard under 'Request sent': no buttons for users (admins keep their menu)."""
-        return self.menu_markup(s, True) if self.is_admin(uid) else None
+        """Keyboard under 'Request sent': My request for users, full menu for admins."""
+        if self.is_admin(uid):
+            return self.menu_markup(s, True)
+        return {"inline_keyboard": [[{"text": "My request", "callback_data": "hist"}]]}
 
     async def user_markup(self, s, uid):
-        """Main keyboard, or support-only while the user has a request waiting."""
         if await self.has_open_request(uid):
             return self.locked_markup(s, uid)
         return self.menu_markup(s, self.is_admin(uid))
 
     def menu_view(self, s, uid):
-        text = f"<b>Welcome</b>\n\n{s['welcome']}"  # already Telegram HTML
+        text = f"<b>Welcome</b>\n\n{s['welcome']}"
         return text, self.menu_markup(s, self.is_admin(uid))
 
     async def menu(self, chat_id, uid=None):
         s = await self.settings()
         text, markup = self.menu_view(s, uid)
-        if await self.has_open_request(uid):  # one request at a time: Deposit / Withdraw hidden
+        if await self.has_open_request(uid):
             text += "\n\n<i>Your request is waiting for the admin's review.</i>"
             markup = self.locked_markup(s, uid)
         await self.ui(chat_id, text, markup)
@@ -744,6 +757,7 @@ class Bot:
                 {"text": "Broadcast", "callback_data": "adm:bc"},
                 {"text": "Bans", "callback_data": "adm:bans"},
             ],
+            [{"text": "Open requests", "callback_data": "adm:reqs"}],
             [{"text": "Main menu", "callback_data": "menu"}],
         ]}
         return text, markup
@@ -756,13 +770,14 @@ class Bot:
         st = await self.kv_get("stats", dict(STATS0))
 
         def block(title, p):
-            pending = max(st[f"{p}_req"] - st[f"{p}_ok"] - st[f"{p}_no"], 0)
+            pending = max(st[f"{p}_req"] - st[f"{p}_ok"] - st[f"{p}_no"] - st[f"{p}_cl"], 0)
             return (
                 f"<b>{title}</b>\n"
                 + card([
                     ("Requests", st[f"{p}_req"]),
                     ("Approved", st[f"{p}_ok"]),
                     ("Rejected", st[f"{p}_no"]),
+                    ("Closed", st[f"{p}_cl"]),
                     ("Pending", pending),
                 ])
             )
@@ -861,7 +876,6 @@ class Bot:
                 chat_id, "No users registered yet.",
                 {"inline_keyboard": [[{"text": "Back", "callback_data": "adm:home"}]]},
             )
-        # the admin's message stays (it's what gets copied); replace the old prompt with a confirm
         await self.delete(chat_id, self.pm)
         self.pm = None
         await self.set_state(chat_id, {"step": "bc_confirm", "mid": msg["message_id"]})
@@ -909,7 +923,7 @@ class Bot:
             results = await asyncio.gather(*[self._copy_one(u, admin_chat, mid) for u in ids[i:i + 20]])
             for r in results:
                 counts[r] += 1
-            await asyncio.sleep(0.7)  # stay under Telegram's ~30 msg/sec limit
+            await asyncio.sleep(0.7)
         await self.ui(
             admin_chat,
             "<b>Broadcast finished</b>\n\n"
@@ -923,8 +937,7 @@ class Bot:
 
     # ---------- Bans (admin) ----------
     async def bans(self, fresh=False):
-        """{user id: {"n": name, "t": time}}. One KV key, kept in memory for CACHE_TTL seconds, so checking
-        every update against it costs (almost) nothing. fresh=True re-reads it (used before changing it)."""
+        """{user id: {"n": name, "t": time}}. One KV key, kept in memory for CACHE_TTL seconds."""
         if self.kv is None:
             return {}
         hit = _CACHE.get("bans")
@@ -936,14 +949,13 @@ class Bot:
             data = json.loads(raw) if isinstance(raw, str) else None
         except Exception:
             print("bans read error", traceback.format_exc())
-            return hit[1] if hit else {}  # keep the last known list; a failed read is not remembered
+            return hit[1] if hit else {}
         if not isinstance(data, dict):
             data = await self._import_old_bans()
         _CACHE["bans"] = (now + CACHE_TTL, data)
         return data
 
     async def _import_old_bans(self):
-        """Once: the previous version stored one key per banned user (ban:<id>)."""
         out = {}
         for i in await self._list_ids("ban:"):
             old = await self.kv_get(f"ban:{i}", {})
@@ -959,7 +971,6 @@ class Bot:
         return True
 
     async def is_banned(self, uid):
-        """Banned users are ignored by the bot. Admins can never be banned."""
         if self.kv is None or self.is_admin(uid):
             return False
         return str(uid) in await self.bans()
@@ -975,7 +986,7 @@ class Bot:
         if uid in bans:
             return "already"
         name = ""
-        try:  # best effort: keep the name so the Bans list shows who it is, not just a number
+        try:
             d = as_json(await self.tg("getChat", {"chat_id": int(uid)}))
             name = user_label((d or {}).get("result") or {})
         except Exception:
@@ -992,7 +1003,6 @@ class Bot:
             await self._save_bans({k: v for k, v in bans.items() if k != str(uid)})
 
     async def list_banned(self):
-        """(total, [(user id, name), ...]) with the BAN_SHOW most recent bans."""
         bans = await self.bans(fresh=True)
         items = sorted(bans.items(), key=lambda it: -int((it[1] or {}).get("t") or 0) if isinstance(it[1], dict) else 0)
         return len(items), [(i, (v.get("n") or "") if isinstance(v, dict) else "") for i, v in items[:BAN_SHOW]]
@@ -1043,8 +1053,7 @@ class Bot:
     # ---------- Admin notification ----------
     async def send_to_admin(self, user, kind, amount, proof=None, account=None, xid=None,
                             code=None, method=None, tk=None):
-        """Notify every admin. Returns (request id carried by the Approve / Reject buttons,
-        whether at least one admin received the card)."""
+        """Notify every admin. Returns (request id, whether at least one admin received the card)."""
         rid = new_rid()
         title = "New deposit request" if kind == "d" else "New withdraw request"
         rows = [
@@ -1061,7 +1070,7 @@ class Bot:
             rows.append(("Method", esc(method)))
         if account:
             rows.append(("Account", f"<code>{esc(account)}</code>"))
-        ref = amount if kind == "d" else code  # what the buttons carry: amount (deposit) or code (withdraw)
+        ref = amount if kind == "d" else code
         buttons = [[
             {"text": "Approve", "callback_data": f"ok:{kind}:{user['id']}:{ref}:{rid}"},
             {"text": "Reject", "callback_data": f"no:{kind}:{user['id']}:{ref}:{rid}"},
@@ -1077,19 +1086,20 @@ class Bot:
                     "from_chat_id": proof["chat"]["id"],
                     "message_id": proof["message_id"],
                 }
-                cd = as_json(await self.tg("forwardMessage", fwd))  # real forward of the user's message
+                cd = as_json(await self.tg("forwardMessage", fwd))
                 if not (cd and cd.get("ok")):
-                    cd = as_json(await self.tg("copyMessage", fwd))  # fallback if forwarding is refused
+                    cd = as_json(await self.tg("copyMessage", fwd))
             d = as_json(await self.send(aid, f"<b>{title}</b>\n\n{card(rows)}", markup))
             mid = ((d or {}).get("result") or {}).get("message_id")
             if mid:
                 msgs.append([aid, mid])
-        # the record lets us ignore a second tap and update every admin's copy
         await self.kv_set(
             f"req:{rid}",
             {"k": kind, "u": user["id"], "a": ref, "m": msgs, "tk": tk, "s": "p"},
             REQ_TTL,
         )
+        await self.open_add(rid, {"k": kind, "u": user["id"], "a": ref,
+                                  "t": int(time.time()), "n": user_label(user)[:40]})
         return rid, bool(msgs)
 
     async def notify_decision(self, user_id, kind, ref, approved, reason):
@@ -1114,7 +1124,59 @@ class Bot:
                 [{"text": "Main menu", "callback_data": "menu"}],
             ]}
         d = as_json(await self.send(user_id, f"<b>{title}</b>\n\n{info}\n\n{note}", markup))
-        return bool(d and d.get("ok"))  # False when the user blocked the bot / chat not found
+        return bool(d and d.get("ok"))
+
+    async def notify_closed(self, uid, kind, ref):
+        what = "Deposit" if kind == "d" else "Withdrawal"
+        s = await self.settings()
+        await self.send(
+            uid,
+            f"<b>{what} request closed</b>\n\nThe admin closed your request. "
+            "You can send a new one or contact support.",
+            self.menu_markup(s, self.is_admin(uid)),
+        )
+
+    async def close_request(self, rid, by):
+        """Close an open request (admin or user). Returns (result, record)."""
+        rec = await self.kv_get(f"req:{rid}", None)
+        if not isinstance(rec, dict):
+            return "expired", None
+        if rec.get("s") != "p":
+            return "done", rec
+        rec["s"] = "c"
+        await self.kv_set(f"req:{rid}", rec, REQ_TTL)
+        rows = [[{"text": f"Closed by {by}"[:60], "callback_data": "noop"}]]
+        if not self.is_admin(rec["u"]):
+            rows.append([{"text": "Ban user", "callback_data": f"bn:{rec['u']}"}])
+        for c, m in rec.get("m") or []:
+            await self.tg("editMessageReplyMarkup", {
+                "chat_id": c, "message_id": m, "reply_markup": {"inline_keyboard": rows}})
+        if rec.get("tk"):  # receipt / code can be used again
+            try:
+                await self.kv.delete(rec["tk"])
+            except Exception:
+                pass
+        await self.open_drop(rid)
+        await self.hist_update(rec["u"], rid, "c")  # also frees the user's lock
+        await self.bump("dep_cl" if rec["k"] == "d" else "wit_cl")
+        return "ok", rec
+
+    async def reqs_view(self, note=""):
+        idx = await self.open_all()
+        items = sorted(idx.items(), key=lambda it: -int(it[1].get("t", 0)))[:OPEN_SHOW]
+        rows, btns = [], []
+        for n, (rid, v) in enumerate(items, 1):
+            day = time.strftime("%d %b %H:%M", time.gmtime(int(v.get("t", 0)) + 3 * 3600))
+            what = "Deposit" if v["k"] == "d" else "Withdraw"
+            detail = f"{fmt(v['a'])} ETB" if v["k"] == "d" else f"code {esc(str(v['a']))}"
+            rows.append((str(n), f"{what} {detail} · {esc(v.get('n', ''))} · {day}"))
+            btns.append([{"text": f"Close #{n}", "callback_data": f"adm:close:{rid}"},
+                         {"text": f"Chat #{n}", "url": f"tg://user?id={v['u']}"}])
+        body = card(rows) if rows else "No open requests."
+        if len(idx) > len(items):
+            body += f"\n<i>Showing {len(items)} of {len(idx)}.</i>"
+        btns.append([{"text": "Back", "callback_data": "adm:home"}])
+        return f"<b>Open requests</b>\n\n{note}{body}", {"inline_keyboard": btns}
 
     async def finish_reject(self, chat_id, st, reason):
         """Admin gave a reason (or skipped): tell the user."""
@@ -1134,7 +1196,7 @@ class Bot:
                 back,
             )
 
-    # ---------- Spam limit + one open request at a time (both live in the user's record) ----------
+    # ---------- Spam limit + one open request at a time ----------
     async def rate_ok(self, uid):
         if self.kv is None or self.is_admin(uid):
             return True
@@ -1142,16 +1204,15 @@ class Bot:
         return int(time.time()) - int(t) >= 3600 or int(n) < MAX_REQ_HOUR
 
     async def has_open_request(self, uid):
-        """True while the user's last request is still waiting for an admin. Admins are never limited.
-        The lock frees itself after PEND_TTL in case nobody ever answers."""
+        """True while the user's last request is still waiting. Admins are never limited."""
         if self.kv is None or self.is_admin(uid):
             return False
         p = (await self.urec(uid)).get("p")
         return bool(p) and time.time() - int(p[1]) < PEND_TTL
 
-    # ---------- Request history ("My requests", reachable with /history) ----------
+    # ---------- "My request" ----------
     async def hist_update(self, uid, rid, status):
-        """The admin decided: show it in the user's history and free the one-open-request lock."""
+        """A request was decided / closed: show it in the user's record and free the lock."""
         if self.kv is None or not rid:
             return
         rec = await self.urec(uid)
@@ -1167,30 +1228,39 @@ class Bot:
         if changed:
             await self.usave(uid)
 
-    def hist_view(self, items):
-        names = {"p": "Pending", "a": "Approved", "r": "Rejected"}
-        items = [i for i in items if isinstance(i, dict) and i.get("k") in ("d", "w")]
-        if not items:
-            body = "You have no requests yet."
+    async def hist_view(self, uid):
+        """Shows only the user's current open request (with a Close button)."""
+        rec = await self.urec(uid)
+        pend = [i for i in (rec.get("h") or []) if isinstance(i, dict)
+                and i.get("k") in ("d", "w") and i.get("s") == "p"]
+        p, it = rec.get("p"), None
+        if self.is_admin(uid):
+            it = pend[-1] if pend else None
+        elif p and time.time() - int(p[1]) < PEND_TTL:
+            it = next((i for i in pend if i.get("r") == p[0]), None)
+        rows = []
+        if it:
+            day = time.strftime("%d %b %H:%M", time.gmtime(int(it.get("t", 0)) + 3 * 3600))
+            if it["k"] == "d":
+                info = [("Type", "Deposit"), ("Amount", f"<b>{fmt(it['a'])} ETB</b>")]
+            else:
+                info = [("Type", "Withdrawal"), ("Code", esc(str(it["a"])))]
+            body = card(info + [("Sent", day), ("Status", "Waiting for admin")])
+            rows.append([{"text": "Close request", "callback_data": f"uc:{it['r']}"}])
         else:
-            rows = []
-            for it in reversed(items):
-                what = "Deposit" if it["k"] == "d" else "Withdrawal"
-                day = time.strftime("%d %b", time.gmtime(int(it.get("t", 0)) + 3 * 3600))  # Ethiopia, UTC+3
-                detail = f"{fmt(it['a'])} ETB" if it["k"] == "d" else f"code {esc(str(it['a']))}"
-                rows.append((day, f"{what} {detail} · {names.get(it.get('s'), '')}"))
-            body = card(rows)
-        markup = {"inline_keyboard": [[{"text": "Main menu", "callback_data": "menu"}]]}
-        return f"<b>Your requests</b>\n\n{body}", markup
+            body = "You have no open request."
+        rows.append([{"text": "Main menu", "callback_data": "menu"}])
+        return f"<b>My request</b>\n\n{body}", {"inline_keyboard": rows}
 
     def help_view(self, uid):
         lines = [
             "<b>Help</b>\n",
             "<b>Deposit</b> · send the amount, your 1xBet ID, then your payment proof.",
             "<b>Withdraw</b> · send your 4-character withdraw code, then where to receive the money.",
+            "<b>My request</b> · see or close your open request.",
             "<b>Support</b> · contact the admin if you have a problem.\n",
             "/start · main menu",
-            "/history · your requests",
+            "/history · my request",
             "/help · this message",
         ]
         if self.is_admin(uid):
@@ -1241,14 +1311,12 @@ class Bot:
         await self.step(chat_id, text, markup, {"step": "dep2", "amount": str(amount)})
 
     async def proof_error(self, chat_id, amount, xid, s, error):
-        """Show the problem as a NEW message under the user's proof (an edit of the old prompt
-        up the chat would go unnoticed)."""
         await self.delete(chat_id, self.pm)
         self.pm = None
         await self.show_pay_step(chat_id, amount, xid, s, error=error)
 
     async def show_pay_step(self, chat_id, amount, xid, s, error=None):
-        pay = s["pay_info"]  # already Telegram HTML
+        pay = s["pay_info"]
         pay_block = pay if "<blockquote" in pay else f"<blockquote>{pay}</blockquote>"
         note = err(error) if error else ""
         body = (
@@ -1288,7 +1356,7 @@ class Bot:
             print("ADMIN_ID is not set")
             return await self.ui(chat_id, "Service unavailable. Please try again later.")
         if not xid:
-            return await self.ask_xbet(chat_id, amount)  # safety net
+            return await self.ask_xbet(chat_id, amount)
         if not await self.rate_ok(uid):
             await self.clear_state(chat_id)
             return await self.ui(
@@ -1299,14 +1367,13 @@ class Bot:
             await self.clear_state(chat_id)
             return await self.ui(chat_id, OPEN_MSG, self.locked_markup(s, uid))
 
-        # the proof must be a screenshot / file, or a transaction ID that looks real
         ident = proof_ident(msg)
         if not ident:
             return await self.proof_error(
                 chat_id, amount, xid, s, "Send a screenshot or a valid transaction ID.",
             )
         tk = None
-        if self.kv is not None and not self.is_admin(uid):  # admins can test with the same screenshot
+        if self.kv is not None and not self.is_admin(uid):
             tk = hkey("txn:", ident)
             if await self.kv_exists(tk):
                 return await self.proof_error(
@@ -1319,7 +1386,6 @@ class Bot:
         await self.note_request(uid, rid, "d", amount, delivered, xid=xid)
         await self.bump("dep_req")
         await self.clear_state(chat_id)
-        # the user's proof stays in the chat, so remove the old prompt and confirm below it
         await self.delete(chat_id, self.pm)
         self.pm = None
         await self.ui(
@@ -1357,7 +1423,6 @@ class Bot:
     async def ask_wit_method(self, chat_id, code):
         saved = await self.get_accounts(chat_id)
         rows = []
-        # one-tap saved accounts, e.g. "CBE · 1000010201"
         for a in saved:
             rows.append([{
                 "text": f"{METHODS[a['m']]} · {a['a']}",
@@ -1415,7 +1480,7 @@ class Bot:
         if await self.has_open_request(user["id"]):
             await self.clear_state(chat_id)
             return await self.ui(chat_id, OPEN_MSG, self.locked_markup(s, user["id"]))
-        tk = hkey("wc:", code) if self.kv is not None else None  # case sensitive
+        tk = hkey("wc:", code) if self.kv is not None else None
         if tk and await self.kv_exists(tk):
             await self.clear_state(chat_id)
             return await self.ui(
@@ -1463,7 +1528,6 @@ class Bot:
         self.pm = state.get("pm")
 
         if text.startswith("/start") or text.startswith("/admin"):
-            # start fresh: drop any old prompt and the command itself
             await self.delete(chat_id, self.pm)
             if self.kv is not None:
                 await self.delete(chat_id, msg["message_id"])
@@ -1482,7 +1546,7 @@ class Bot:
             if text.startswith("/help"):
                 out, markup = self.help_view(uid)
             else:
-                out, markup = self.hist_view(await self.get_hist(uid))
+                out, markup = await self.hist_view(uid)
             return await self.ui(chat_id, out, markup)
 
         # Admin is typing the reason for a rejection
@@ -1494,7 +1558,7 @@ class Bot:
                 return
             return await self.finish_reject(chat_id, state, reason)
 
-        # Admin is composing a broadcast: any message type is accepted
+        # Admin is composing a broadcast
         if step == "bc" and self.is_admin(uid):
             return await self.on_broadcast_msg(msg)
 
@@ -1504,7 +1568,7 @@ class Bot:
                 await self.delete(chat_id, msg["message_id"])
             return await self.on_ban_msg(chat_id, text)
 
-        # Fallback when storage is off: work out the step from the message being replied to
+        # Fallback when storage is off
         if not step and reply:
             if SET_MARK in reply:
                 m = re.search(r"ref: (\w+)", reply)
@@ -1548,7 +1612,7 @@ class Bot:
             return await self.on_wit_account(msg, state["code"], state.get("method"), text)
 
         if (msg.get("photo") or msg.get("document")) and not step:
-            if msg.get("media_group_id"):  # several photos at once: the first one already got an answer
+            if msg.get("media_group_id"):
                 return
             s = await self.settings()
             return await self.ui(
@@ -1564,7 +1628,7 @@ class Bot:
         data = q.get("data") or ""
         uid = q["from"]["id"]
         chat_id = q["message"]["chat"]["id"]
-        self.pm = q["message"]["message_id"]  # the message the user tapped is the one we edit
+        self.pm = q["message"]["message_id"]
 
         if data in ("deposit", "withdraw"):
             is_dep = data == "deposit"
@@ -1623,7 +1687,6 @@ class Bot:
             if mkey not in METHODS or not parse_account(mkey, account) or not parse_wit_code(code):
                 return await self.answer(q)
             await self.answer(q)
-            # remove the buttons first so a double tap can't send it twice
             await self.tg("editMessageReplyMarkup", {
                 "chat_id": chat_id,
                 "message_id": q["message"]["message_id"],
@@ -1638,7 +1701,7 @@ class Bot:
             state = await self.get_state(chat_id) or {}
             if state.get("step") != "bc_confirm" or not state.get("mid"):
                 return await self.answer(q, "This broadcast has expired.", True)
-            await self.clear_state(chat_id)  # clear first so a retried update can't send it twice
+            await self.clear_state(chat_id)
             await self.answer(q)
             await self.ui(chat_id, "<b>Broadcast</b>\n\nSending…")
             return await self.run_broadcast(chat_id, state["mid"])
@@ -1648,9 +1711,20 @@ class Bot:
             await self.clear_state(chat_id)
             return await self.menu(chat_id, uid)
 
+        # User closes their own open request
+        if data.startswith("uc:"):
+            rid = data[3:]
+            rec = await self.kv_get(f"req:{rid}", None)
+            if not isinstance(rec, dict) or str(rec.get("u")) != str(uid):
+                return await self.answer(q, "This request is no longer available.", True)
+            res, _ = await self.close_request(rid, "user")
+            await self.answer(q, "Request closed." if res == "ok" else "The admin already handled it.", True)
+            out, markup = await self.hist_view(uid)
+            return await self.ui(chat_id, out, markup)
+
         if data == "hist":
             await self.answer(q)
-            out, markup = self.hist_view(await self.get_hist(uid))
+            out, markup = await self.hist_view(uid)
             return await self.ui(chat_id, out, markup)
 
         # Admin skipped the rejection reason
@@ -1674,15 +1748,16 @@ class Bot:
                 rec = await self.kv_get(f"req:{rid}", None)
                 if not isinstance(rec, dict):
                     return await self.answer(q, "This request has expired.", True)
-                if rec.get("s") != "p":  # another tap or another admin got there first
-                    done = "approved" if rec.get("s") == "a" else "rejected"
+                if rec.get("s") != "p":
+                    done = {"a": "approved", "r": "rejected", "c": "closed"}.get(rec.get("s"), "handled")
                     return await self.answer(q, f"Already {done}.", True)
                 rec["s"] = "a" if approved else "r"
                 await self.kv_set(f"req:{rid}", rec, REQ_TTL)
+                await self.open_drop(rid)
             await self.answer(q)
 
             notified = None
-            if approved:  # tell the user first, so the admin's card can show whether it arrived
+            if approved:
                 notified = await self.notify_decision(user_id, kind, ref, True, None)
 
             who = (q["from"].get("first_name") or "admin")[:20]
@@ -1694,9 +1769,9 @@ class Bot:
             elif notified is False:
                 done_rows.append([{"text": "⚠️ User did NOT receive it", "callback_data": "noop"}])
                 done_rows.append([{"text": "Open user chat", "url": f"tg://user?id={user_id}"}])
-            if not self.is_admin(user_id):  # the Ban button stays on the card after the decision
+            if not self.is_admin(user_id):
                 done_rows.append([{"text": "Ban user", "callback_data": f"bn:{user_id}"}])
-            for c, m in targets:  # every admin's copy shows the result
+            for c, m in targets:
                 await self.tg("editMessageReplyMarkup", {
                     "chat_id": c,
                     "message_id": m,
@@ -1705,18 +1780,17 @@ class Bot:
             await self.bump(f"{'dep' if kind == 'd' else 'wit'}_{'ok' if approved else 'no'}")
             await self.hist_update(user_id, rid, "a" if approved else "r")
 
-            # a rejected receipt may be used again; a withdraw code is free again once handled
             if rec and rec.get("tk") and (not approved or kind == "w"):
                 try:
                     await self.kv.delete(rec["tk"])
                 except Exception:
                     print("txn delete error", traceback.format_exc())
             if approved:
-                return  # the user was already notified above
-            if self.kv is None:  # no storage = can't wait for a reason
+                return
+            if self.kv is None:
                 return await self.notify_decision(user_id, kind, ref, False, None)
-            await self.clear_state(chat_id)  # an unfinished earlier reason is sent without text
-            self.pm = None  # new message, the request card above stays as it is
+            await self.clear_state(chat_id)
+            self.pm = None
             return await self.step(
                 chat_id,
                 "<b>Reject reason</b>\n\nSend a short reason for the user, or tap Skip.\n\nType it below.",
@@ -1760,6 +1834,22 @@ class Bot:
                 await self.unban_user(parts[2])
                 text, markup = await self.bans_view(f"<b>Unbanned</b> · <code>{parts[2]}</code>\n\n")
                 return await self.ui(chat_id, text, markup)
+            if parts[1] == "reqs":
+                await self.answer(q)
+                text, markup = await self.reqs_view()
+                return await self.ui(chat_id, text, markup)
+            if parts[1] == "close" and len(parts) == 3:
+                await self.answer(q)
+                who = (q["from"].get("first_name") or "admin")[:20]
+                res, rec = await self.close_request(parts[2], f"admin {who}")
+                if res == "ok":
+                    await self.notify_closed(rec["u"], rec["k"], rec["a"])
+                else:
+                    await self.open_drop(parts[2])  # stale entry: remove it from the list
+                note = {"ok": "<b>Closed</b>\n\n", "done": err("Already handled."),
+                        "expired": err("Request expired.")}[res]
+                text, markup = await self.reqs_view(note)
+                return await self.ui(chat_id, text, markup)
             s = await self.settings()
             if parts[1] in ("tdep", "twit"):
                 key = "dep_on" if parts[1] == "tdep" else "wit_on"
@@ -1796,7 +1886,7 @@ class Default(WorkerEntrypoint):
         })
         cmds = await bot.tg("setMyCommands", {"commands": [
             {"command": "start", "description": "Main menu"},
-            {"command": "history", "description": "My requests"},
+            {"command": "history", "description": "My request"},
             {"command": "help", "description": "How it works"},
         ]})
         return Response(f"setWebhook: {hook}\nsetMyCommands: {cmds}")
@@ -1827,7 +1917,6 @@ class Default(WorkerEntrypoint):
             return await self.setup(request)
         if request.method != "POST":
             return Response("OK")
-        # only Telegram knows the secret, so fake updates are refused
         secret = getattr(self.env, "WEBHOOK_SECRET", None)
         if secret:
             got = request.headers.get("X-Telegram-Bot-Api-Secret-Token") or ""
