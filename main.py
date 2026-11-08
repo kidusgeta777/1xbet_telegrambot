@@ -47,6 +47,7 @@ OPEN_MSG = "You already have a request waiting for the admin. Please wait for th
 BAN_MSG = "You are not allowed to use this bot."
 CACHE_TTL = 30  # seconds settings and the ban list are kept in memory
 _CACHE = {}  # name -> (valid until, value)
+_BUSY = set()  # request ids being approved / rejected right now (blocks double taps)
 _SEEN = set()  # users this instance has already registered
 
 # short key (used in callback_data) -> label
@@ -1744,12 +1745,32 @@ class Bot:
             rid = parts[4] if len(parts) > 4 else None
             approved = action == "ok"
             rec = None
+            msg_ref = {"chat_id": chat_id, "message_id": q["message"]["message_id"]}
+            if rid:
+                if rid in _BUSY:  # a second tap while the first is still working
+                    return await self.answer(q)
+                if len(_BUSY) > 5000:
+                    _BUSY.clear()
+                _BUSY.add(rid)
+                # take the buttons away at once, so one tap is all that's needed (and possible)
+                await self.tg("editMessageReplyMarkup", {
+                    **msg_ref,
+                    "reply_markup": {"inline_keyboard": [[{"text": "Processing…", "callback_data": "noop"}]]},
+                })
             if rid and self.kv is not None:
                 rec = await self.kv_get(f"req:{rid}", None)
                 if not isinstance(rec, dict):
+                    await self.tg("editMessageReplyMarkup", {
+                        **msg_ref,
+                        "reply_markup": {"inline_keyboard": [[{"text": "Expired", "callback_data": "noop"}]]},
+                    })
                     return await self.answer(q, "This request has expired.", True)
                 if rec.get("s") != "p":
                     done = {"a": "approved", "r": "rejected", "c": "closed"}.get(rec.get("s"), "handled")
+                    await self.tg("editMessageReplyMarkup", {
+                        **msg_ref,
+                        "reply_markup": {"inline_keyboard": [[{"text": f"Already {done}", "callback_data": "noop"}]]},
+                    })
                     return await self.answer(q, f"Already {done}.", True)
                 rec["s"] = "a" if approved else "r"
                 await self.kv_set(f"req:{rid}", rec, REQ_TTL)
