@@ -1784,12 +1784,16 @@ class Bot:
             who = (q["from"].get("first_name") or "admin")[:20]
             label = f"{'Approved' if approved else 'Rejected'} by {who}"[:60]
             targets = rec["m"] if rec and rec.get("m") else [[chat_id, q["message"]["message_id"]]]
-            done_rows = [[{"text": label, "callback_data": "noop"}]]
-            if notified is True:
-                done_rows.append([{"text": "✅ User received the message", "callback_data": "noop"}])
-            elif notified is False:
-                done_rows.append([{"text": "⚠️ User did NOT receive it", "callback_data": "noop"}])
-                done_rows.append([{"text": "Open user chat", "url": f"tg://user?id={user_id}"}])
+            if approved:  # one line only: no "Approved by ..." button
+                if notified is False:
+                    done_rows = [
+                        [{"text": "⚠️ User approved, but did NOT receive it", "callback_data": "noop"}],
+                        [{"text": "Open user chat", "url": f"tg://user?id={user_id}"}],
+                    ]
+                else:
+                    done_rows = [[{"text": "✅ User approved", "callback_data": "noop"}]]
+            else:
+                done_rows = [[{"text": label, "callback_data": "noop"}]]
             if not self.is_admin(user_id):
                 done_rows.append([{"text": "Ban user", "callback_data": f"bn:{user_id}"}])
             for c, m in targets:
