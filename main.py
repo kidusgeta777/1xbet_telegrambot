@@ -1100,7 +1100,8 @@ class Bot:
                 [{"text": "Contact support", "url": self.support_url(s)}],
                 [{"text": "Main menu", "callback_data": "menu"}],
             ]}
-        await self.send(user_id, f"<b>{title}</b>\n\n{info}\n\n{note}", markup)
+        d = as_json(await self.send(user_id, f"<b>{title}</b>\n\n{info}\n\n{note}", markup))
+        return bool(d and d.get("ok"))  # False when the user blocked the bot / chat not found
 
     async def finish_reject(self, chat_id, st, reason):
         """Admin gave a reason (or skipped): tell the user."""
@@ -1108,8 +1109,17 @@ class Bot:
         if st.get("step") != "reason":
             return await self.ui(chat_id, "Nothing to send.", back)
         await self.clear_state(chat_id, notify=False)
-        await self.notify_decision(st["uid"], st["kind"], st["ref"], False, reason)
-        await self.ui(chat_id, "<b>Rejected</b>\n\nThe user was notified.", back)
+        ok = await self.notify_decision(st["uid"], st["kind"], st["ref"], False, reason)
+        if ok:
+            await self.ui(chat_id, "<b>Rejected</b>\n\n✅ The user received the message.", back)
+        else:
+            back["inline_keyboard"].insert(0, [{"text": "Open user chat", "url": f"tg://user?id={st['uid']}"}])
+            await self.ui(
+                chat_id,
+                "<b>Rejected</b>\n\n⚠️ <b>The user did not receive the message</b> "
+                "(they may have blocked the bot). Contact them yourself.",
+                back,
+            )
 
     # ---------- Spam limit + one open request at a time (both live in the user's record) ----------
     async def rate_ok(self, uid):
@@ -1657,10 +1667,19 @@ class Bot:
                 await self.kv_set(f"req:{rid}", rec, REQ_TTL)
             await self.answer(q)
 
-            who = q["from"].get("first_name") or "admin"
+            notified = None
+            if approved:  # tell the user first, so the admin's card can show whether it arrived
+                notified = await self.notify_decision(user_id, kind, ref, True, None)
+
+            who = (q["from"].get("first_name") or "admin")[:20]
             label = f"{'Approved' if approved else 'Rejected'} by {who}"[:60]
             targets = rec["m"] if rec and rec.get("m") else [[chat_id, q["message"]["message_id"]]]
             done_rows = [[{"text": label, "callback_data": "noop"}]]
+            if notified is True:
+                done_rows.append([{"text": "✅ User received the message", "callback_data": "noop"}])
+            elif notified is False:
+                done_rows.append([{"text": "⚠️ User did NOT receive it", "callback_data": "noop"}])
+                done_rows.append([{"text": "Open user chat", "url": f"tg://user?id={user_id}"}])
             if not self.is_admin(user_id):  # the Ban button stays on the card after the decision
                 done_rows.append([{"text": "Ban user", "callback_data": f"bn:{user_id}"}])
             for c, m in targets:  # every admin's copy shows the result
@@ -1679,7 +1698,7 @@ class Bot:
                 except Exception:
                     print("txn delete error", traceback.format_exc())
             if approved:
-                return await self.notify_decision(user_id, kind, ref, True, None)
+                return  # the user was already notified above
             if self.kv is None:  # no storage = can't wait for a reason
                 return await self.notify_decision(user_id, kind, ref, False, None)
             await self.clear_state(chat_id)  # an unfinished earlier reason is sent without text
