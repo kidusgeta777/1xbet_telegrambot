@@ -2,6 +2,8 @@
 # Secrets/vars:
 #   BOT_TOKEN       Telegram bot token
 #   ADMIN_ID        one Telegram user id, or several separated by commas (e.g. 111,222)
+#   OWNER_ID        (optional) the owner's Telegram id. Defaults to the first ADMIN_ID. Only the owner
+#                   can move a deposit / withdraw request to another agent.
 #   WEBHOOK_SECRET  random string (A-Z a-z 0-9 _ -). Telegram must send it back with every update.
 #                   Open  https://<your-worker>/setup?key=<WEBHOOK_SECRET>  once to register the webhook.
 # KV binding named SETTINGS (needed for settings, stats, conversation state, broadcast, saved accounts,
@@ -45,6 +47,10 @@ BAN_SHOW = 20  # banned users listed (with Unban buttons) on the Bans screen
 OPEN_SHOW = 8  # open requests listed on the admin "Open requests" screen
 OPEN_MSG = "You already have a request waiting for the admin. Please wait for the reply before sending another."
 BAN_MSG = "You are not allowed to use this bot."
+PING_TTL = 600  # an online check stays answerable this long (seconds)
+PING_WAIT = 180  # after this long without an answer the customer is told the agent may be offline
+PING_COOLDOWN = 60  # one online check per customer per minute (KV minimum TTL)
+_NAMES = {}  # agent id -> display name
 CACHE_TTL = 30  # seconds settings and the ban list are kept in memory
 _CACHE = {}  # name -> (valid until, value)
 _BUSY = set()  # request ids being approved / rejected right now (blocks double taps)
@@ -320,6 +326,10 @@ class Bot:
             if raw_admin else []
         )
         self.admin_id = self.admins[0] if self.admins else None
+        raw_owner = getattr(env, "OWNER_ID", None)
+        self.owner = str(raw_owner).strip() if raw_owner else self.admin_id
+        if self.owner and self.owner not in self.admins:
+            self.admins.insert(0, self.owner)
         self.secret = getattr(env, "WEBHOOK_SECRET", None)
         self.kv = getattr(env, "SETTINGS", None)
         self.pm = None  # id of the bot message currently on screen (edited in place)
@@ -461,6 +471,24 @@ class Bot:
 
     def is_admin(self, uid):
         return str(uid) in self.admins
+
+    def is_owner(self, uid):
+        return bool(self.owner) and str(uid) == str(self.owner)
+
+    async def agent_name(self, aid):
+        aid = str(aid)
+        if aid in _NAMES:
+            return _NAMES[aid]
+        name = f"Agent {aid}"
+        try:
+            r = (as_json(await self.tg("getChat", {"chat_id": aid})) or {}).get("result") or {}
+            n = " ".join(x for x in [r.get("first_name"), r.get("last_name")] if x) or r.get("title")
+            if n:
+                name = f"{n} (@{r['username']})" if r.get("username") else n
+        except Exception:
+            print("agent name error", traceback.format_exc())
+        _NAMES[aid] = name[:40]
+        return _NAMES[aid]
 
     # ---------- Conversation state (so users can just type) ----------
     async def get_state(self, cid):
@@ -686,9 +714,11 @@ class Bot:
                 {"text": "Withdraw", "callback_data": "withdraw"},
             ],
             [{"text": "My request", "callback_data": "hist"}],
+            [{"text": "Is agent online?", "callback_data": "ao:ask"}],
             [{"text": "Contact support", "url": self.support_url(s)}],
         ]
         if admin:
+            rows.pop(2)  # admins don't need the online check
             rows.append([{"text": "Admin panel", "callback_data": "adm:home"}])
         return {"inline_keyboard": rows}
 
@@ -698,6 +728,7 @@ class Bot:
             return self.menu_markup(s, True)
         return {"inline_keyboard": [
             [{"text": "My request", "callback_data": "hist"}],
+            [{"text": "Is agent online?", "callback_data": "ao:ask"}],
             [{"text": "Contact support", "url": self.support_url(s)}],
         ]}
 
@@ -1072,15 +1103,10 @@ class Bot:
         if account:
             rows.append(("Account", f"<code>{esc(account)}</code>"))
         ref = amount if kind == "d" else code
-        buttons = [[
-            {"text": "Approve", "callback_data": f"ok:{kind}:{user['id']}:{ref}:{rid}"},
-            {"text": "Reject", "callback_data": f"no:{kind}:{user['id']}:{ref}:{rid}"},
-        ]]
-        if not self.is_admin(user["id"]):
-            buttons.append([{"text": "Ban user", "callback_data": f"bn:{user['id']}"}])
-        markup = {"inline_keyboard": buttons}
+        card_text = f"<b>{title}</b>\n\n{card(rows)}"
         msgs = []
         for aid in self.admins:
+            markup = self.req_markup(rid, kind, user["id"], ref, aid)
             if kind == "d" and proof:
                 fwd = {
                     "chat_id": aid,
@@ -1090,18 +1116,193 @@ class Bot:
                 cd = as_json(await self.tg("forwardMessage", fwd))
                 if not (cd and cd.get("ok")):
                     cd = as_json(await self.tg("copyMessage", fwd))
-            d = as_json(await self.send(aid, f"<b>{title}</b>\n\n{card(rows)}", markup))
+            d = as_json(await self.send(aid, card_text, markup))
             mid = ((d or {}).get("result") or {}).get("message_id")
             if mid:
                 msgs.append([aid, mid])
         await self.kv_set(
             f"req:{rid}",
-            {"k": kind, "u": user["id"], "a": ref, "m": msgs, "tk": tk, "s": "p"},
+            {"k": kind, "u": user["id"], "a": ref, "m": msgs, "tk": tk, "s": "p",
+             "tx": card_text,
+             "pf": [proof["chat"]["id"], proof["message_id"]] if (kind == "d" and proof) else None},
             REQ_TTL,
         )
         await self.open_add(rid, {"k": kind, "u": user["id"], "a": ref,
                                   "t": int(time.time()), "n": user_label(user)[:40]})
         return rid, bool(msgs)
+
+    # ---------- Request card buttons + reassign (owner only) ----------
+    def req_markup(self, rid, kind, user_id, ref, viewer, note=None):
+        rows = [[
+            {"text": "Approve", "callback_data": f"ok:{kind}:{user_id}:{ref}:{rid}"},
+            {"text": "Reject", "callback_data": f"no:{kind}:{user_id}:{ref}:{rid}"},
+        ]]
+        if note:
+            rows.insert(0, [{"text": note[:60], "callback_data": "noop"}])
+        if not self.is_admin(user_id):
+            rows.append([{"text": "Ban user", "callback_data": f"bn:{user_id}"}])
+        if self.is_owner(viewer) and len(self.admins) > 1:
+            rows.append([{"text": "Reassign to another agent", "callback_data": f"ra:{rid}"}])
+        return {"inline_keyboard": rows}
+
+    async def set_markup(self, chat, mid, markup):
+        await self.tg("editMessageReplyMarkup", {"chat_id": chat, "message_id": mid, "reply_markup": markup})
+
+    async def assign_note(self, rec, viewer):
+        """Small header button showing who the request is assigned to (None = nobody, all agents see it)."""
+        a = rec.get("as")
+        if not a:
+            return None
+        if str(viewer) == str(a):
+            return "Assigned to you"
+        return f"Assigned to {await self.agent_name(a)}"
+
+    async def reassign_pick(self, q, rid):
+        rec = await self.kv_get(f"req:{rid}", None)
+        if not isinstance(rec, dict) or rec.get("s") != "p":
+            return await self.answer(q, "This request is no longer open.", True)
+        rows = []
+        for aid in self.admins:
+            name = await self.agent_name(aid)
+            mark = "✓ " if str(rec.get("as") or "") == str(aid) else ""
+            you = " (you)" if self.is_owner(aid) else ""
+            rows.append([{"text": f"{mark}{name}{you}"[:60], "callback_data": f"rb:{rid}:{aid}"}])
+        rows.append([{"text": "Back", "callback_data": f"rc:{rid}"}])
+        await self.answer(q)
+        await self.set_markup(q["message"]["chat"]["id"], q["message"]["message_id"], {"inline_keyboard": rows})
+
+    async def reassign_back(self, q, rid):
+        rec = await self.kv_get(f"req:{rid}", None)
+        await self.answer(q)
+        if not isinstance(rec, dict) or rec.get("s") != "p":
+            return await self.set_markup(q["message"]["chat"]["id"], q["message"]["message_id"],
+                                         {"inline_keyboard": [[{"text": "No longer open", "callback_data": "noop"}]]})
+        uid = q["from"]["id"]
+        await self.set_markup(q["message"]["chat"]["id"], q["message"]["message_id"],
+                              self.req_markup(rid, rec["k"], rec["u"], rec["a"], uid,
+                                              await self.assign_note(rec, uid)))
+
+    async def reassign_do(self, q, rid, aid):
+        """Owner moved the request to one agent. Everybody else loses the Approve / Reject buttons."""
+        if aid not in self.admins:
+            return await self.answer(q, "Unknown agent.", True)
+        if rid in _BUSY:
+            return await self.answer(q, "This request is being handled right now.", True)
+        rec = await self.kv_get(f"req:{rid}", None)
+        if not isinstance(rec, dict) or rec.get("s") != "p":
+            return await self.answer(q, "This request is no longer open.", True)
+        name = await self.agent_name(aid)
+        rec["as"] = str(aid)
+        msgs = [list(m) for m in (rec.get("m") or [])]
+        new_mid = None
+        if not self.is_owner(aid):  # the new agent gets a fresh card (and the payment proof) to be notified
+            pf = rec.get("pf")
+            if pf:
+                fwd = {"chat_id": aid, "from_chat_id": pf[0], "message_id": pf[1]}
+                cd = as_json(await self.tg("forwardMessage", fwd))
+                if not (cd and cd.get("ok")):
+                    await self.tg("copyMessage", fwd)
+            d = as_json(await self.send(
+                aid, "<b>Assigned to you</b>\n\n" + (rec.get("tx") or "<b>Request</b>"),
+                self.req_markup(rid, rec["k"], rec["u"], rec["a"], aid)))
+            new_mid = ((d or {}).get("result") or {}).get("message_id")
+            if not new_mid:
+                return await self.answer(
+                    q, f"{name} could not be reached. They must open the bot and tap Start first.", True)
+            msgs.append([aid, new_mid])
+        rec["m"] = msgs
+        await self.kv_set(f"req:{rid}", rec, REQ_TTL)
+        for c, m in msgs:
+            if new_mid and str(c) == str(aid) and m == new_mid:
+                continue  # the fresh card is already correct
+            if str(c) == str(aid):  # the owner's own card when the owner takes it back
+                mk = self.req_markup(rid, rec["k"], rec["u"], rec["a"], c, "Assigned to you")
+            elif self.is_owner(c):
+                mk = self.req_markup(rid, rec["k"], rec["u"], rec["a"], c, f"Assigned to {name}")
+            else:
+                mk = {"inline_keyboard": [[{"text": f"Moved to {name}"[:60], "callback_data": "noop"}]]}
+            await self.set_markup(c, m, mk)
+        await self.answer(q, f"Assigned to {name}.", True)
+
+    # ---------- "Is agent online?" (customer asks, the agent confirms) ----------
+    async def online_ask(self, q):
+        uid = q["from"]["id"]
+        chat_id = q["message"]["chat"]["id"]
+        if self.kv is None or not self.admins:
+            return await self.answer(q, "Online check is not available right now.", True)
+        if await self.kv_exists(f"pgcd:{uid}"):
+            return await self.answer(q, "Please wait a minute before checking again.", True)
+        await self.answer(q)
+        pid = new_rid()
+        now = int(time.time())
+        card_text = ("<b>Online check</b>\n\n"
+                     + card([("User", esc(user_label(q["from"]))), ("User ID", f"<code>{uid}</code>")])
+                     + "\n\nThis customer asks if you are online. Tap to let them know.")
+        markup = {"inline_keyboard": [[
+            {"text": "I'm online", "callback_data": f"ap:y:{pid}"},
+            {"text": "Not available", "callback_data": f"ap:n:{pid}"},
+        ]]}
+        msgs = []
+        for aid in self.admins:
+            d = as_json(await self.send(aid, card_text, markup))
+            mid = ((d or {}).get("result") or {}).get("message_id")
+            if mid:
+                msgs.append([aid, mid])
+        if not msgs:
+            return await self.ui(chat_id, "<b>Online check</b>\n\n" + err("Couldn't reach the agent. Please try again later."),
+                                 {"inline_keyboard": [[{"text": "Main menu", "callback_data": "menu"}]]})
+        await self.kv_set(f"ping:{pid}", {"u": uid, "s": "p", "t": now, "m": msgs}, PING_TTL)
+        await self.kv_set(f"pgcd:{uid}", 1, PING_COOLDOWN)
+        await self.online_status(chat_id, pid, uid)
+
+    async def online_status(self, chat_id, pid, uid):
+        rec = await self.kv_get(f"ping:{pid}", None)
+        back = [{"text": "Main menu", "callback_data": "menu"}]
+        if not isinstance(rec, dict) or str(rec.get("u")) != str(uid):
+            return await self.ui(chat_id, "<b>Online check</b>\n\nThis check has expired. Tap <b>Is agent online?</b> to ask again.",
+                                 {"inline_keyboard": [back]})
+        s = rec.get("s")
+        if s == "y":
+            return await self.ui(chat_id, "<b>Agent is online</b> ✅\n\nYou can send your request now.",
+                                 await self.user_markup(await self.settings(), uid))
+        if s == "n":
+            return await self.ui(chat_id, "<b>Agent not available</b>\n\nThe agent can't take requests right now. "
+                                 "You can still send one; it will wait for the reply.",
+                                 await self.user_markup(await self.settings(), uid))
+        waited = int(time.time()) - int(rec.get("t", 0))
+        if waited >= PING_WAIT:
+            text = ("<b>No reply yet</b>\n\nThe agent may be offline. You can still send your request; "
+                    "it will wait for the agent's reply.")
+        else:
+            text = "<b>Checking…</b>\n\nYour check was sent. The agent's answer will appear here."
+        rows = [[{"text": "Refresh", "callback_data": f"ao:st:{pid}"}], back]
+        await self.ui(chat_id, text, {"inline_keyboard": rows})
+
+    async def online_answer(self, q, yes, pid):
+        """An agent answered a customer's online check."""
+        rec = await self.kv_get(f"ping:{pid}", None)
+        if not isinstance(rec, dict):
+            return await self.answer(q, "This check has expired.", True)
+        who = (q["from"].get("first_name") or "agent")[:20]
+        if rec.get("s") != "p":
+            await self.answer(q, "Already answered.", True)
+            done = "online" if rec.get("s") == "y" else "unavailable"
+            return await self.set_markup(q["message"]["chat"]["id"], q["message"]["message_id"],
+                                         {"inline_keyboard": [[{"text": f"Already answered ({done})", "callback_data": "noop"}]]})
+        rec["s"] = "y" if yes else "n"
+        rec["by"] = str(q["from"]["id"])
+        await self.kv_set(f"ping:{pid}", rec, PING_TTL)
+        await self.answer(q, "The customer was told you are online." if yes else "The customer was told you are not available.")
+        label = f"✅ Online · confirmed by {who}" if yes else f"Not available · by {who}"
+        for c, m in rec.get("m") or []:
+            await self.set_markup(c, m, {"inline_keyboard": [[{"text": label[:60], "callback_data": "noop"}]]})
+        s = await self.settings()
+        if yes:
+            text = "<b>Agent is online</b> ✅\n\nYou can send your request now."
+        else:
+            text = ("<b>Agent not available</b>\n\nThe agent can't take requests right now. "
+                    "You can still send one; it will wait for the reply.")
+        await self.send(rec["u"], text, await self.user_markup(s, rec["u"]))
 
     async def notify_decision(self, user_id, kind, ref, approved, reason):
         what = "Deposit" if kind == "d" else "Withdrawal"
@@ -1259,6 +1460,7 @@ class Bot:
             "<b>Deposit</b> · send the amount, your 1xBet ID, then your payment proof.",
             "<b>Withdraw</b> · send your 4-character withdraw code, then where to receive the money.",
             "<b>My request</b> · see or close your open request.",
+            "<b>Is agent online?</b> · ask the agent to confirm they are available.",
             "<b>Support</b> · contact the admin if you have a problem.\n",
             "/start · main menu",
             "/history · my request",
@@ -1735,6 +1937,32 @@ class Bot:
             await self.answer(q)
             return await self.finish_reject(chat_id, await self.get_state(chat_id) or {}, None)
 
+        # Customer asks "Is agent online?"
+        if data == "ao:ask":
+            return await self.online_ask(q)
+        if data.startswith("ao:st:"):
+            await self.answer(q)
+            return await self.online_status(chat_id, data[6:], uid)
+
+        # Agent answers an online check
+        if data.startswith(("ap:y:", "ap:n:")):
+            if not self.is_admin(uid):
+                return await self.answer(q, "Not allowed", True)
+            return await self.online_answer(q, data[3] == "y", data[5:])
+
+        # Owner moves a request to another agent
+        if data.startswith(("ra:", "rb:", "rc:")):
+            if not self.is_owner(uid):
+                return await self.answer(q, "Only the owner can reassign requests.", True)
+            parts = data.split(":")
+            if parts[0] == "ra" and len(parts) == 2:
+                return await self.reassign_pick(q, parts[1])
+            if parts[0] == "rc" and len(parts) == 2:
+                return await self.reassign_back(q, parts[1])
+            if parts[0] == "rb" and len(parts) == 3:
+                return await self.reassign_do(q, parts[1], parts[2])
+            return await self.answer(q)
+
         if data.startswith(("ok:", "no:")):
             if not self.is_admin(uid):
                 return await self.answer(q, "Not allowed", True)
@@ -1743,6 +1971,10 @@ class Bot:
                 return await self.answer(q)
             action, kind, user_id, ref = parts[:4]
             rid = parts[4] if len(parts) > 4 else None
+            if rid and self.kv is not None and not self.is_owner(uid):
+                pre = await self.kv_get(f"req:{rid}", None)
+                if isinstance(pre, dict) and pre.get("as") and str(pre["as"]) != str(uid):
+                    return await self.answer(q, "This request was assigned to another agent.", True)
             approved = action == "ok"
             rec = None
             msg_ref = {"chat_id": chat_id, "message_id": q["message"]["message_id"]}
