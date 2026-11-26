@@ -70,7 +70,10 @@ DEFAULTS = {
     "support": SUPPORT_USER,
     "alt_on": False,  # Alt mode: requests go to the alt agents instead of the main admins
     "alts": [],  # Telegram ids of alt agents
+    "alt_cur": "",  # the alt agent in use while Alt mode is on
+    "alt_prof": {},  # alt agent id -> own settings (min_dep, max_dep, pay_info, support, dep_on, wit_on)
 }
+ALT_KEYS = ("min_dep", "max_dep", "pay_info", "support")  # what an alt agent can set for themself
 MAX_ALTS = 5
 STATS0 = {"dep_req": 0, "dep_ok": 0, "dep_no": 0, "dep_cl": 0,
           "wit_req": 0, "wit_ok": 0, "wit_no": 0, "wit_cl": 0}
@@ -331,6 +334,7 @@ class Bot:
         self.admin_id = self.admins[0] if self.admins else None
         self.alts = []  # alt agents (loaded from storage on every update, see load_alts)
         self.alt_on = False
+        self.alt_cur = None  # the alt agent in use
         raw_owner = getattr(env, "OWNER_ID", None)
         self.owner = str(raw_owner).strip() if raw_owner else self.admin_id
         if self.owner and self.owner not in self.admins:
@@ -468,6 +472,20 @@ class Bot:
         _CACHE["settings"] = (time.time() + CACHE_TTL, s)
         return dict(s)
 
+    async def eff_settings(self):
+        """What customers see: the main settings, overridden by the alt agent in use while Alt mode is on."""
+        s = await self.settings()
+        if not (self.alt_on and self.alt_cur):
+            return s
+        prof = (s.get("alt_prof") or {}).get(self.alt_cur) or {}
+        for k in ALT_KEYS:
+            if k in prof:
+                s[k] = prof[k]
+        # the main switches stay a master kill-switch; the agent has their own on top
+        s["dep_on"] = bool(s["dep_on"]) and bool(prof.get("dep_on", True))
+        s["wit_on"] = bool(s["wit_on"]) and bool(prof.get("wit_on", True))
+        return s
+
     async def save_settings(self, s):
         ok = await self.kv_set("settings", s)
         if ok:
@@ -484,11 +502,13 @@ class Bot:
     async def load_alts(self):
         s = await self.settings()
         self.alts = [str(x) for x in (s.get("alts") or []) if str(x).isdigit()]
-        self.alt_on = bool(s.get("alt_on")) and bool(self.alts)
+        cur = str(s.get("alt_cur") or "")
+        self.alt_cur = cur if cur in self.alts else (self.alts[0] if self.alts else None)
+        self.alt_on = bool(s.get("alt_on")) and bool(self.alt_cur)
 
     def recipients(self):
-        """Who gets new requests and online checks: the alt agents while Alt mode is on."""
-        return list(self.alts) if self.alt_on and self.alts else list(self.admins)
+        """Who gets new requests and online checks: the alt agent in use while Alt mode is on."""
+        return [self.alt_cur] if self.alt_on and self.alt_cur else list(self.admins)
 
     def is_owner(self, uid):
         return bool(self.owner) and str(uid) == str(self.owner)
@@ -763,10 +783,13 @@ class Bot:
 
     def menu_view(self, s, uid):
         text = f"<b>Welcome</b>\n\n{s['welcome']}"
-        return text, self.menu_markup(s, self.is_admin(uid))
+        markup = self.menu_markup(s, self.is_admin(uid))
+        if str(uid) in self.alts and not self.is_admin(uid):
+            markup["inline_keyboard"].append([{"text": "My agent settings", "callback_data": "ag:home"}])
+        return text, markup
 
     async def menu(self, chat_id, uid=None):
-        s = await self.settings()
+        s = await self.eff_settings()
         text, markup = self.menu_view(s, uid)
         if await self.has_open_request(uid):
             text += "\n\n<i>Your request is waiting for the admin's review.</i>"
@@ -1109,23 +1132,152 @@ class Bot:
         s = await self.settings()
         on = bool(s.get("alt_on"))
         alts = [str(a) for a in (s.get("alts") or [])]
+        cur = str(s.get("alt_cur") or "")
+        cur = cur if cur in alts else (alts[0] if alts else "")
         rows = [("Alt mode", "<b>On</b>" if on else "<b>Off</b>")]
         for n, a in enumerate(alts, 1):
-            rows.append((str(n), f"{esc(await self.agent_name(a))} · <code>{a}</code>"))
+            tag = " · <b>in use</b>" if a == cur else ""
+            rows.append((str(n), f"{esc(await self.agent_name(a))} · <code>{a}</code>{tag}"))
         if not alts:
             rows.append(("Agents", "none yet"))
-        how = ("New deposit / withdraw requests and online checks go to the <b>alt agents</b> only."
+        how = ("New deposit / withdraw requests and online checks go to the <b>alt agent in use</b>, "
+               "and customers see that agent's payment details and limits."
                if on else
-               "Alt mode is off: requests go to the main admins. Turn it on to send them to the alt agents.")
+               "Alt mode is off: requests go to the main admins. Turn it on to send them to the alt agent in use.")
         text = f"<b>Alt agent</b>\n\n{note}{card(rows)}\n\n{how}"
         btns = [[
             {"text": "Add agent", "callback_data": "adm:altadd"},
             {"text": f"Alt mode: {'On' if on else 'Off'}", "callback_data": "adm:alttog"},
         ]]
         for a in alts:
-            btns.append([{"text": f"Remove {await self.agent_name(a)}"[:60], "callback_data": f"adm:altrm:{a}"}])
+            row = [{"text": f"⚙ {await self.agent_name(a)}"[:40], "callback_data": f"adm:alta:{a}"}]
+            if a != cur:
+                row.append({"text": "Use", "callback_data": f"adm:altuse:{a}"})
+            row.append({"text": "Remove", "callback_data": f"adm:altrm:{a}"})
+            btns.append(row)
         btns.append([{"text": "Back", "callback_data": "adm:home"}])
         return text, {"inline_keyboard": btns}
+
+    # ----- one alt agent's own settings (the owner edits any, an alt agent edits their own) -----
+    def _acb(self, mine, aid, *parts):
+        """Callback data for the alt agent screens: 'ag:' for the agent themself, 'adm:alt..' for the owner."""
+        if mine:
+            return "ag:" + ":".join(parts)
+        op = {"home": "alta", "set": "alts", "t": "altt"}[parts[0]]
+        return ":".join(["adm", op, str(aid), *parts[1:]]) if parts[0] != "home" else f"adm:alta:{aid}"
+
+    async def alt_prof_view(self, aid, mine, note=""):
+        s = await self.settings()
+        aid = str(aid)
+        prof = (s.get("alt_prof") or {}).get(aid) or {}
+        in_use = bool(s.get("alt_on")) and str(s.get("alt_cur") or "") == aid
+
+        def money(k):
+            return f"{fmt(prof[k])} ETB" if k in prof else f"{fmt(s[k])} ETB <i>(main)</i>"
+
+        if prof.get("support") is not None and "support" in prof:
+            sup = f"@{esc(prof['support'])}" if prof["support"] else "none"
+        else:
+            sup = f"@{esc(s['support'])} <i>(main)</i>" if s["support"] else "<i>(main)</i> none"
+        pay = esc(plain(prof["pay_info"])[:80]) if prof.get("pay_info") else "⚠️ <b>not set</b>"
+        rows = [
+            ("Agent", f"{esc(await self.agent_name(aid))} · <code>{aid}</code>"),
+            ("Status", "<b>In use</b>" if in_use else "Not in use"),
+            ("Min deposit", money("min_dep")),
+            ("Max deposit", money("max_dep")),
+            ("Payment info", pay),
+            ("Support", sup),
+            ("Deposits", "<b>On</b>" if prof.get("dep_on", True) else "<b>Off</b>"),
+            ("Withdrawals", "<b>On</b>" if prof.get("wit_on", True) else "<b>Off</b>"),
+        ]
+        text = f"<b>{'My agent settings' if mine else 'Alt agent settings'}</b>\n\n{note}{card(rows)}"
+        text += "\n\nThese apply to customers while this agent is in use."
+        cb = lambda *a: self._acb(mine, aid, *a)
+        markup = {"inline_keyboard": [
+            [{"text": "Min deposit", "callback_data": cb("set", "min_dep")},
+             {"text": "Max deposit", "callback_data": cb("set", "max_dep")}],
+            [{"text": "Payment info", "callback_data": cb("set", "pay_info")},
+             {"text": "Support", "callback_data": cb("set", "support")}],
+            [{"text": f"Deposits: {'On' if prof.get('dep_on', True) else 'Off'}", "callback_data": cb("t", "dep")},
+             {"text": f"Withdrawals: {'On' if prof.get('wit_on', True) else 'Off'}", "callback_data": cb("t", "wit")}],
+            [{"text": "Back" if not mine else "Main menu", "callback_data": "adm:alt" if not mine else "menu"}],
+        ]}
+        return text, markup
+
+    async def ask_alt_setting(self, chat_id, aid, key, mine, error=False):
+        if self.kv is None:
+            return await self.ui(chat_id, "Alt agents need storage. Connect a KV namespace named <code>SETTINGS</code> first.",
+                                 {"inline_keyboard": [[{"text": "Back", "callback_data": "menu"}]]})
+        label, kind = SETTING_INFO[key]
+        note = err("That value isn't valid. Try again.") if error else ""
+        hint = "a number" if kind == "number" else "your text"
+        extra = ""
+        if kind == "rich":
+            extra = ("\n<i>Formatting is kept. Use Telegram's formatting, or type "
+                     "**bold**, _italic_, __underline__, ~~strike~~, `code`, [text](https://link).</i>\n")
+        text = f"<b>Alt agent setting</b>\n\n{note}<b>{esc(label)}</b>\nSend {hint}.\n{extra}\n{self.how_to()}"
+        await self.step(chat_id, text, self.prompt_markup(label[:60]),
+                        {"step": "aset", "key": key, "aid": str(aid), "mine": bool(mine)})
+
+    async def save_alt_setting(self, msg, state):
+        chat_id = msg["chat"]["id"]
+        key, aid, mine = state.get("key"), str(state.get("aid") or ""), bool(state.get("mine"))
+        text = msg.get("text") or ""
+        if key not in ALT_KEYS or aid not in self.alts:
+            await self.clear_state(chat_id)
+            return await self.menu(chat_id, msg["from"]["id"])
+        label, kind = SETTING_INFO[key]
+        s = await self.settings()
+        profs = s.get("alt_prof") or {}
+        prof = dict(profs.get(aid) or {})
+        if kind == "number":
+            value = parse_amount(text)
+            if value is None:
+                return await self.ask_alt_setting(chat_id, aid, key, mine, True)
+            lo = value if key == "min_dep" else prof.get("min_dep", s["min_dep"])
+            hi = value if key == "max_dep" else prof.get("max_dep", s["max_dep"])
+            if lo > hi:  # min above max would block every deposit
+                return await self.ask_alt_setting(chat_id, aid, key, mine, True)
+        elif kind == "rich":
+            if not text.strip() or len(text) > MAX_TEXT:
+                return await self.ask_alt_setting(chat_id, aid, key, mine, True)
+            value = to_html(text.strip(), msg.get("entities"))
+        else:
+            value = text.strip()
+            value = "" if value == "-" else re.sub(r"[^A-Za-z0-9_]", "", value.lstrip("@"))
+            value = value[:500]
+        prof[key] = value
+        profs[aid] = prof
+        s["alt_prof"] = profs
+        saved = await self.save_settings(s)
+        await self.clear_state(chat_id)
+        note = (f"<b>Saved</b> · {esc(label)}\n\n" if saved else
+                err("Couldn't save. Connect a KV namespace named <code>SETTINGS</code> first."))
+        out, markup = await self.alt_prof_view(aid, mine, note)
+        await self.ui(chat_id, out, markup)
+
+    async def alt_prof_action(self, q, chat_id, aid, parts, mine):
+        """parts: ['home'] | ['set', key] | ['t', 'dep'|'wit']"""
+        aid = str(aid)
+        if aid not in self.alts:
+            return await self.answer(q, "This agent no longer exists.", True)
+        note = ""
+        if parts[0] == "set" and len(parts) == 2 and parts[1] in ALT_KEYS:
+            await self.answer(q)
+            return await self.ask_alt_setting(chat_id, aid, parts[1], mine)
+        if parts[0] == "t" and len(parts) == 2 and parts[1] in ("dep", "wit"):
+            s = await self.settings()
+            profs = s.get("alt_prof") or {}
+            prof = dict(profs.get(aid) or {})
+            k = "dep_on" if parts[1] == "dep" else "wit_on"
+            prof[k] = not prof.get(k, True)
+            profs[aid] = prof
+            s["alt_prof"] = profs
+            if not await self.save_settings(s):
+                return await self.answer(q, "Storage not connected: can't save.", True)
+        await self.answer(q)
+        out, markup = await self.alt_prof_view(aid, mine, note)
+        return await self.ui(chat_id, out, markup)
 
     async def ask_alt(self, chat_id, error=None):
         if self.kv is None:
@@ -1155,12 +1307,19 @@ class Bot:
         d = as_json(await self.send(
             t,
             "<b>You were added as an alt agent</b>\n\n"
-            "When Alt mode is on, deposit and withdraw requests will arrive here. "
-            "Tap <b>Approve</b> or <b>Reject</b> on each card.",
+            "When Alt mode is on and you are in use, deposit and withdraw requests will arrive here. "
+            "Tap <b>Approve</b> or <b>Reject</b> on each card.\n\n"
+            "Open the bot menu and tap <b>My agent settings</b> to set your payment info, "
+            "deposit limits and support username.",
         ))
         if not (d and d.get("ok")):
             return await self.ask_alt(chat_id, "Couldn't reach that person. They must open the bot and tap Start first.")
         s["alts"] = alts + [t]
+        if not s.get("alt_cur"):
+            s["alt_cur"] = t
+        profs = s.get("alt_prof") or {}
+        profs.setdefault(t, {})
+        s["alt_prof"] = profs
         await self.clear_state(chat_id)
         if not await self.save_settings(s):
             text_out, markup = await self.alt_view(err("Couldn't save. Connect a KV namespace named <code>SETTINGS</code> first."))
@@ -1271,11 +1430,11 @@ class Bot:
         s = rec.get("s")
         if s == "y":
             return await self.ui(chat_id, "<b>Agent is online</b> ✅\n\nYou can send your request now.",
-                                 await self.user_markup(await self.settings(), uid))
+                                 await self.user_markup(await self.eff_settings(), uid))
         if s == "n":
             return await self.ui(chat_id, "<b>Agent not available</b>\n\nThe agent can't take requests right now. "
                                  "You can still send one; it will wait for the reply.",
-                                 await self.user_markup(await self.settings(), uid))
+                                 await self.user_markup(await self.eff_settings(), uid))
         waited = int(time.time()) - int(rec.get("t", 0))
         if waited >= PING_WAIT:
             text = ("<b>No reply yet</b>\n\nThe agent may be offline. You can still send your request; "
@@ -1303,7 +1462,7 @@ class Bot:
         label = f"✅ Online · confirmed by {who}" if yes else f"Not available · by {who}"
         for c, m in rec.get("m") or []:
             await self.set_markup(c, m, {"inline_keyboard": [[{"text": label[:60], "callback_data": "noop"}]]})
-        s = await self.settings()
+        s = await self.eff_settings()
         if yes:
             text = "<b>Agent is online</b> ✅\n\nYou can send your request now."
         else:
@@ -1325,7 +1484,7 @@ class Bot:
             info = card([("Amount", f"<b>{fmt(ref)} ETB</b>")])
         else:
             info = card([("Withdraw code", f"<code>{esc(str(ref))}</code>")])
-        s = await self.settings()
+        s = await self.eff_settings()
         markup = self.menu_markup(s, self.is_admin(user_id))
         if approved:
             markup = {"inline_keyboard": [
@@ -1337,7 +1496,7 @@ class Bot:
 
     async def notify_closed(self, uid, kind, ref):
         what = "Deposit" if kind == "d" else "Withdrawal"
-        s = await self.settings()
+        s = await self.eff_settings()
         await self.send(
             uid,
             f"<b>{what} request closed</b>\n\nThe admin closed your request. "
@@ -1490,7 +1649,7 @@ class Bot:
         await self.step(chat_id, text, self.prompt_markup("Amount in ETB"), {"step": "dep1"})
 
     async def on_amount(self, chat_id, text):
-        s = await self.settings()
+        s = await self.eff_settings()
         if not s["dep_on"]:
             await self.clear_state(chat_id)
             return await self.ui(chat_id, "Deposits are temporarily unavailable. Please try again later.")
@@ -1546,7 +1705,7 @@ class Bot:
         )
 
     async def on_xbet(self, chat_id, amount, text):
-        s = await self.settings()
+        s = await self.eff_settings()
         if not s["dep_on"]:
             await self.clear_state(chat_id)
             return await self.ui(chat_id, "Deposits are temporarily unavailable. Please try again later.")
@@ -1558,7 +1717,7 @@ class Bot:
     async def on_proof(self, msg, amount, xid):
         chat_id = msg["chat"]["id"]
         uid = msg["from"]["id"]
-        s = await self.settings()
+        s = await self.eff_settings()
         if not s["dep_on"]:
             await self.clear_state(chat_id)
             return await self.ui(chat_id, "Deposits are temporarily unavailable. Please try again later.")
@@ -1619,7 +1778,7 @@ class Bot:
         await self.step(chat_id, text, self.prompt_markup("Withdraw code"), {"step": "wit1"})
 
     async def on_wit_code(self, chat_id, text):
-        s = await self.settings()
+        s = await self.eff_settings()
         if not s["wit_on"]:
             await self.clear_state(chat_id)
             return await self.ui(chat_id, "Withdrawals are temporarily unavailable. Please try again later.")
@@ -1674,7 +1833,7 @@ class Bot:
 
     async def submit_withdraw(self, user, chat_id, code, mkey, account):
         """Final step, shared by typed accounts and saved-account buttons."""
-        s = await self.settings()
+        s = await self.eff_settings()
         if not s["wit_on"]:
             await self.clear_state(chat_id)
             return await self.ui(chat_id, "Withdrawals are temporarily unavailable. Please try again later.")
@@ -1747,6 +1906,13 @@ class Bot:
                 return await self.send_panel(chat_id)
             return await self.menu(chat_id, uid)
 
+        if text.startswith("/agent") and str(uid) in self.alts:
+            await self.delete(chat_id, self.pm)
+            self.pm = None
+            await self.clear_state(chat_id)
+            out, markup = await self.alt_prof_view(uid, True)
+            return await self.ui(chat_id, out, markup)
+
         if text.startswith("/help") or text.startswith("/history"):
             await self.delete(chat_id, self.pm)
             if self.kv is not None:
@@ -1771,6 +1937,12 @@ class Bot:
         # Admin is composing a broadcast
         if step == "bc" and self.is_admin(uid):
             return await self.on_broadcast_msg(msg)
+
+        # Alt agent (or the owner) is typing one of the alt agent's own settings
+        if step == "aset" and (self.is_owner(uid) or (str(uid) in self.alts and str(uid) == str(state.get("aid")))):
+            if self.kv is not None:
+                await self.delete(chat_id, msg["message_id"])
+            return await self.save_alt_setting(msg, state)
 
         # Owner is typing the ID of an alt agent to add
         if step == "alt" and self.is_owner(uid):
@@ -1830,7 +2002,7 @@ class Bot:
         if (msg.get("photo") or msg.get("document")) and not step:
             if msg.get("media_group_id"):
                 return
-            s = await self.settings()
+            s = await self.eff_settings()
             return await self.ui(
                 chat_id,
                 "<b>Session expired</b>\n\nI couldn't match this file to a request. "
@@ -1848,7 +2020,7 @@ class Bot:
 
         if data in ("deposit", "withdraw"):
             is_dep = data == "deposit"
-            s = await self.settings()
+            s = await self.eff_settings()
             if not s["dep_on" if is_dep else "wit_on"]:
                 return await self.answer(q, "Temporarily unavailable. Please try again later.", True)
             if not await self.rate_ok(uid):
@@ -1862,7 +2034,7 @@ class Bot:
 
         # Saved 1xBet ID: one tap moves on to the payment step
         if data.startswith("sx:"):
-            s = await self.settings()
+            s = await self.eff_settings()
             if not s["dep_on"]:
                 return await self.answer(q, "Temporarily unavailable. Please try again later.", True)
             try:
@@ -1879,7 +2051,7 @@ class Bot:
 
         # New withdraw account: user picked CBE / Telebirr / CBE Birr
         if data.startswith("wm:"):
-            s = await self.settings()
+            s = await self.eff_settings()
             if not s["wit_on"]:
                 return await self.answer(q, "Temporarily unavailable. Please try again later.", True)
             try:
@@ -1893,7 +2065,7 @@ class Bot:
 
         # Saved withdraw account: one tap sends the request
         if data.startswith("sa:"):
-            s = await self.settings()
+            s = await self.eff_settings()
             if not s["wit_on"]:
                 return await self.answer(q, "Temporarily unavailable. Please try again later.", True)
             try:
@@ -1949,6 +2121,17 @@ class Bot:
                 return await self.answer(q, "Admins only", True)
             await self.answer(q)
             return await self.finish_reject(chat_id, await self.get_state(chat_id) or {}, None)
+
+        # An alt agent edits their own settings
+        if data.startswith("ag:"):
+            if str(uid) not in self.alts:
+                return await self.answer(q, "Not allowed", True)
+            parts = data.split(":")[1:]
+            if not parts or parts[0] not in ("home", "set", "t"):
+                return await self.answer(q)
+            if parts[0] != "set":
+                await self.clear_state(chat_id)
+            return await self.alt_prof_action(q, chat_id, uid, parts, True)
 
         # Customer asks "Is agent online?"
         if data == "ao:ask":
@@ -2096,17 +2279,34 @@ class Bot:
                 if parts[1] == "altadd":
                     await self.answer(q)
                     return await self.ask_alt(chat_id)
+                if parts[1] in ("alta", "alts", "altt") and len(parts) >= 3:
+                    op = {"alta": ["home"], "alts": ["set"], "altt": ["t"]}[parts[1]] + parts[3:]
+                    return await self.alt_prof_action(q, chat_id, parts[2], op, False)
+                if parts[1] == "altuse" and len(parts) == 3 and parts[2] in alts:
+                    s["alt_cur"] = parts[2]
+                    if not await self.save_settings(s):
+                        return await self.answer(q, "Storage not connected: can't save.", True)
+                    note = f"<b>In use</b> · {esc(await self.agent_name(parts[2]))}\n\n"
                 if parts[1] == "alttog":
+                    cur = str(s.get("alt_cur") or "")
+                    cur = cur if cur in alts else (alts[0] if alts else "")
+                    prof = (s.get("alt_prof") or {}).get(cur) or {}
                     if not s.get("alt_on") and not alts:
                         note = err("Add an alt agent first.")
+                    elif not s.get("alt_on") and not prof.get("pay_info"):
+                        note = err("Set the payment info of the agent in use first (⚙ next to their name). "
+                                   "Customers would otherwise pay the wrong account.")
                     else:
                         s["alt_on"] = not s.get("alt_on")
+                        s["alt_cur"] = cur
                         if not await self.save_settings(s):
                             return await self.answer(q, "Storage not connected: can't save.", True)
-                        self.alt_on = bool(s["alt_on"]) and bool(alts)
                         note = f"<b>Alt mode {'on' if s['alt_on'] else 'off'}</b>\n\n"
                 if parts[1] == "altrm" and len(parts) == 3 and parts[2] in alts:
                     s["alts"] = [a for a in alts if a != parts[2]]
+                    (s.get("alt_prof") or {}).pop(parts[2], None)
+                    if str(s.get("alt_cur") or "") == parts[2]:
+                        s["alt_cur"] = s["alts"][0] if s["alts"] else ""
                     if not s["alts"]:
                         s["alt_on"] = False  # nobody left to send to
                     if not await self.save_settings(s):
