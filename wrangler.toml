@@ -11,3 +11,6 @@ invocation_logs = true
 [[kv_namespaces]]
 binding = "SETTINGS"
 id = "dce312130097470cbbdaf0bbf7439aaf"
+
+[triggers]
+crons = ["* * * * *"]  # every minute: moves unanswered online checks to the next alt agent
