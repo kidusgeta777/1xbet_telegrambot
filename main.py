@@ -1428,10 +1428,15 @@ class Bot:
         st = await self.get_state(uid) or {}
         if st.get("step") != "pingwait" or st.get("pid") != rec.get("pid"):
             return True  # the customer left this screen meanwhile
-        self.pm = pm
         if outcome == "y":
-            await self.go_flow(uid, go, "✅ <b>Agent is online</b>\n\n")
+            # A new message (not an edit) so the customer's phone notifies them, then the first step below it.
+            await self.delete(uid, pm)
+            self.pm = None
+            await self.send(uid, "<b>Agent is online</b> ✅\n\nThe agent confirmed they are online. "
+                                 "You can continue with your request now.")
+            await self.go_flow(uid, go)
             return True
+        self.pm = pm
         what = "deposit" if go == "deposit" else "withdrawal"
         if outcome == "n":
             text = (f"<b>Agent not available</b>\n\nThe agent can't take requests right now. "
