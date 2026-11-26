@@ -47,9 +47,12 @@ BAN_SHOW = 20  # banned users listed (with Unban buttons) on the Bans screen
 OPEN_SHOW = 8  # open requests listed on the admin "Open requests" screen
 OPEN_MSG = "You already have a request waiting for the admin. Please wait for the reply before sending another."
 BAN_MSG = "You are not allowed to use this bot."
-PING_TTL = 600  # an online check stays answerable this long (seconds)
+PING_TTL = 900  # an online check stays answerable this long (seconds)
+PING_STEP = 120  # alt agents: no answer after this long -> the check goes to the next agent
+_PING_BUSY = set()  # online checks being moved to the next agent right now
 PING_WAIT = 180  # after this long without an answer the customer is told the agent may be offline
 PING_COOLDOWN = 60  # one online check per customer per minute (KV minimum TTL)
+AUTO_FRESH = 300  # Alt mode: an agent's "I'm online" counts for this long, so the next customers skip the automatic check
 _NAMES = {}  # agent id -> display name
 CACHE_TTL = 30  # seconds settings and the ban list are kept in memory
 _CACHE = {}  # name -> (valid until, value)
@@ -758,17 +761,22 @@ class Bot:
         if admin:
             rows.pop(2)  # admins don't need the online check
             rows.append([{"text": "Admin panel", "callback_data": "adm:home"}])
+        elif self.alt_on:
+            rows.pop(2)  # Alt mode: the bot checks the agent by itself when the customer taps Deposit / Withdraw
         return {"inline_keyboard": rows}
 
     def locked_markup(self, s, uid):
         """Keyboard for screens shown while the user's request is waiting: no Deposit / Withdraw."""
         if self.is_admin(uid):
             return self.menu_markup(s, True)
-        return {"inline_keyboard": [
+        rows = [
             [{"text": "My request", "callback_data": "hist"}],
             [{"text": "Is agent online?", "callback_data": "ao:ask"}],
             [{"text": "Contact support", "url": self.support_url(s)}],
-        ]}
+        ]
+        if self.alt_on:
+            rows.pop(1)
+        return {"inline_keyboard": rows}
 
     def sent_markup(self, s, uid):
         """Keyboard under 'Request sent': My request for users, full menu for admins."""
@@ -1391,35 +1399,191 @@ class Bot:
         await self.tg("editMessageReplyMarkup", {"chat_id": chat, "message_id": mid, "reply_markup": markup})
 
     # ---------- "Is agent online?" (customer asks, the agent confirms) ----------
-    async def online_ask(self, q):
+    async def online_needed(self, uid):
+        """Alt mode: the bot confirms the agent is online when a customer taps Deposit / Withdraw.
+        Skipped for admins / agents, and while the agent in use confirmed a moment ago."""
+        if self.kv is None or not self.alt_on or not self.alts or self.is_agent(uid):
+            return False
+        return await self.kv_get("onlok", None) != str(self.alt_cur)
+
+    async def go_flow(self, uid, go, pre=""):
+        """Move the customer on to the first deposit / withdraw screen."""
+        is_dep = go == "deposit"
+        s = await self.eff_settings()
+        if not s["dep_on" if is_dep else "wit_on"]:
+            return await self.ui(uid, "<b>Temporarily unavailable</b>\n\nPlease try again later.",
+                                 await self.user_markup(s, uid))
+        if await self.has_open_request(uid):
+            return await self.ui(uid, OPEN_MSG, await self.user_markup(s, uid))
+        if is_dep:
+            return await self.ask_amount(uid, s, pre=pre)
+        return await self.ask_wit_code(uid, pre=pre)
+
+    async def online_resume(self, rec, outcome, pm=None):
+        """An automatic online check (started by Deposit / Withdraw) finished: carry the customer on.
+        outcome: y = agent online, n = agent unavailable, x = nobody answered."""
+        go, uid = rec.get("go"), rec.get("u")
+        if not go:
+            return False
+        st = await self.get_state(uid) or {}
+        if st.get("step") != "pingwait" or st.get("pid") != rec.get("pid"):
+            return True  # the customer left this screen meanwhile
+        self.pm = pm
+        if outcome == "y":
+            await self.go_flow(uid, go, "✅ <b>Agent is online</b>\n\n")
+            return True
+        what = "deposit" if go == "deposit" else "withdrawal"
+        if outcome == "n":
+            text = (f"<b>Agent not available</b>\n\nThe agent can't take requests right now. "
+                    f"You can still continue your {what}; it will wait for the reply.")
+        else:
+            text = (f"<b>No agent confirmed yet</b>\n\nNobody answered the online check. "
+                    f"You can still continue your {what}; it will wait for an agent's reply.")
+        await self.ui(uid, text, {"inline_keyboard": [
+            [{"text": f"Continue {what}", "callback_data": f"ao:go:{go}"}],
+            [{"text": "Main menu", "callback_data": "menu"}],
+        ]})
+        return True
+
+    async def online_ask(self, q, go=None):
+        """The customer taps Is agent online? (go=None), or Deposit / Withdraw in Alt mode (go='deposit'|'withdraw')."""
         uid = q["from"]["id"]
         chat_id = q["message"]["chat"]["id"]
-        if self.kv is None or not self.recipients():
-            return await self.answer(q, "Online check is not available right now.", True)
-        if await self.kv_exists(f"pgcd:{uid}"):
-            return await self.answer(q, "Please wait a minute before checking again.", True)
-        await self.answer(q)
+        if not go:
+            if self.kv is None or not self.recipients():
+                return await self.answer(q, "Online check is not available right now.", True)
+            if await self.kv_exists(f"pgcd:{uid}"):
+                return await self.answer(q, "Please wait a minute before checking again.", True)
+            await self.answer(q)
+        else:
+            st = await self.get_state(chat_id) or {}
+            if st.get("step") == "pingwait" and st.get("pid"):  # a check is already running for this customer
+                old = await self.kv_get(f"ping:{st['pid']}", None)
+                if isinstance(old, dict) and old.get("s") == "p":
+                    return await self.online_status(chat_id, st["pid"], uid)
         pid = new_rid()
         now = int(time.time())
-        card_text = ("<b>Online check</b>\n\n"
-                     + card([("User", esc(user_label(q["from"]))), ("User ID", f"<code>{uid}</code>")])
-                     + "\n\nThis customer asks if you are online. Tap to let them know.")
-        markup = {"inline_keyboard": [[
+        rows = [("User", esc(user_label(q["from"]))), ("User ID", f"<code>{uid}</code>")]
+        if go:
+            rows.append(("Wants to", "Deposit" if go == "deposit" else "Withdraw"))
+            ask_line = "This customer wants to " + ("deposit" if go == "deposit" else "withdraw") + ". Tap to confirm you are online."
+        else:
+            ask_line = "This customer asks if you are online. Tap to let them know."
+        card_text = "<b>Online check</b>\n\n" + card(rows) + "\n\n" + ask_line
+        # Alt mode with more than one alt agent (or an automatic check): ask ONE agent at a time, the one in use first.
+        seq = self.alt_on and (len(self.alts) > 1 or bool(go))
+        order = ([self.alt_cur] + [a for a in self.alts if a != self.alt_cur]) if seq else self.recipients()
+        rec = {"pid": pid, "u": uid, "s": "p", "t": now, "m": [], "tx": card_text,
+               "q": order, "i": 0, "ts": now, "seq": seq}
+        if go:
+            rec["go"] = go
+            rec["cm"] = self.pm  # the customer's screen, edited in place when the check ends
+        if seq:
+            ok = await self.ping_deliver(rec, 0)
+        else:
+            for aid in order:
+                d = as_json(await self.send(aid, card_text, self.ping_markup(pid)))
+                mid = ((d or {}).get("result") or {}).get("message_id")
+                if mid:
+                    rec["m"].append([aid, mid])
+            ok = bool(rec["m"])
+        if not ok:
+            if go:  # nobody could be reached: let the customer go on
+                st = {"step": "pingwait", "pid": pid, "go": go}
+                await self.set_state(chat_id, st)
+                return await self.online_resume(rec, "x", self.pm)
+            return await self.ui(chat_id, "<b>Online check</b>\n\n" + err("Couldn't reach the agent. Please try again later."),
+                                 {"inline_keyboard": [[{"text": "Main menu", "callback_data": "menu"}]]})
+        await self.kv_set(f"ping:{pid}", rec, PING_TTL)
+        if seq:
+            await self.ping_idx_add(pid, now)
+        await self.kv_set(f"pgcd:{uid}", 1, PING_COOLDOWN)
+        if go:
+            await self.set_state(chat_id, {"step": "pingwait", "pid": pid, "go": go})
+        await self.online_status(chat_id, pid, uid)
+
+    def ping_markup(self, pid):
+        return {"inline_keyboard": [[
             {"text": "I'm online", "callback_data": f"ap:y:{pid}"},
             {"text": "Not available", "callback_data": f"ap:n:{pid}"},
         ]]}
-        msgs = []
-        for aid in self.recipients():
-            d = as_json(await self.send(aid, card_text, markup))
-            mid = ((d or {}).get("result") or {}).get("message_id")
-            if mid:
-                msgs.append([aid, mid])
-        if not msgs:
-            return await self.ui(chat_id, "<b>Online check</b>\n\n" + err("Couldn't reach the agent. Please try again later."),
-                                 {"inline_keyboard": [[{"text": "Main menu", "callback_data": "menu"}]]})
-        await self.kv_set(f"ping:{pid}", {"u": uid, "s": "p", "t": now, "m": msgs}, PING_TTL)
-        await self.kv_set(f"pgcd:{uid}", 1, PING_COOLDOWN)
-        await self.online_status(chat_id, pid, uid)
+
+    def ping_due(self, rec):
+        return bool(rec.get("seq")) and rec.get("s") == "p" and int(time.time()) - int(rec.get("ts", 0)) >= PING_STEP
+
+    async def ping_deliver(self, rec, start):
+        """Send the check to the first reachable agent at or after position `start` of the queue.
+        True when one agent got it. Agents removed from the alt list in the meantime are skipped."""
+        q = rec["q"]
+        i = int(start)
+        while i < len(q):
+            if str(q[i]) in self.alts:
+                d = as_json(await self.send(q[i], rec["tx"], self.ping_markup(rec["pid"])))
+                mid = ((d or {}).get("result") or {}).get("message_id")
+                if mid:
+                    rec["i"] = i
+                    rec["ts"] = int(time.time())
+                    rec["m"].append([q[i], mid])
+                    return True
+            i += 1
+        rec["i"] = len(q)
+        return False
+
+    async def ping_idx_add(self, pid, ts):
+        idx = await self.kv_get("pingidx", {})
+        cut = int(time.time()) - PING_TTL
+        idx = {k: v for k, v in idx.items() if int(v) > cut}
+        idx[pid] = ts
+        await self.kv_set("pingidx", idx)
+
+    async def ping_idx_drop(self, pid):
+        idx = await self.kv_get("pingidx", {})
+        if pid in idx:
+            del idx[pid]
+            await self.kv_set("pingidx", idx)
+
+    async def ping_advance(self, pid, rec, notify=True, label="No reply · moved to the next agent"):
+        """The agent asked didn't answer in time (or declined): close their card and ask the next one.
+        When nobody is left the customer is told (unless the caller shows that itself)."""
+        if pid in _PING_BUSY:
+            return rec
+        _PING_BUSY.add(pid)
+        try:
+            fresh = await self.kv_get(f"ping:{pid}", None)  # another run may have moved it already
+            if not isinstance(fresh, dict) or fresh.get("s") != "p" or fresh.get("i") != rec.get("i"):
+                return fresh if isinstance(fresh, dict) else rec
+            rec = fresh
+            if rec["m"]:
+                c, m = rec["m"][-1]
+                await self.set_markup(c, m, {"inline_keyboard": [[{"text": label[:60], "callback_data": "noop"}]]})
+            if await self.ping_deliver(rec, int(rec["i"]) + 1):
+                await self.kv_set(f"ping:{pid}", rec, PING_TTL)
+                await self.ping_idx_add(pid, rec["ts"])
+                return rec
+            rec["s"] = "x"  # everybody was asked
+            await self.kv_set(f"ping:{pid}", rec, PING_TTL)
+            await self.ping_idx_drop(pid)
+            if rec.get("go"):  # automatic check from Deposit / Withdraw: offer to continue
+                await self.online_resume(rec, "x", rec.get("cm"))
+            elif notify:
+                await self.send(rec["u"], self.ping_none_text(), await self.user_markup(await self.eff_settings(), rec["u"]))
+            return rec
+        finally:
+            _PING_BUSY.discard(pid)
+
+    def ping_none_text(self):
+        return ("<b>No agent confirmed yet</b>\n\nNobody answered the online check. You can still send your "
+                "request; it will wait for an agent's reply.")
+
+    async def ping_tick(self):
+        """Run every minute by the cron trigger: move overdue online checks to the next alt agent."""
+        idx = await self.kv_get("pingidx", {})
+        for pid in list(idx):
+            rec = await self.kv_get(f"ping:{pid}", None)
+            if not isinstance(rec, dict) or rec.get("s") != "p":
+                await self.ping_idx_drop(pid)
+            elif self.ping_due(rec):
+                await self.ping_advance(pid, rec)
 
     async def online_status(self, chat_id, pid, uid):
         rec = await self.kv_get(f"ping:{pid}", None)
@@ -1427,7 +1591,11 @@ class Bot:
         if not isinstance(rec, dict) or str(rec.get("u")) != str(uid):
             return await self.ui(chat_id, "<b>Online check</b>\n\nThis check has expired. Tap <b>Is agent online?</b> to ask again.",
                                  {"inline_keyboard": [back]})
+        if self.ping_due(rec):  # the cron may not have run yet: move on when the customer looks
+            rec = await self.ping_advance(pid, rec, notify=False)
         s = rec.get("s")
+        if rec.get("go") and s in ("y", "n", "x"):  # automatic check finished: carry on
+            return await self.online_resume(rec, s, self.pm)
         if s == "y":
             return await self.ui(chat_id, "<b>Agent is online</b> ✅\n\nYou can send your request now.",
                                  await self.user_markup(await self.eff_settings(), uid))
@@ -1435,8 +1603,16 @@ class Bot:
             return await self.ui(chat_id, "<b>Agent not available</b>\n\nThe agent can't take requests right now. "
                                  "You can still send one; it will wait for the reply.",
                                  await self.user_markup(await self.eff_settings(), uid))
-        waited = int(time.time()) - int(rec.get("t", 0))
-        if waited >= PING_WAIT:
+        if s == "x":
+            return await self.ui(chat_id, self.ping_none_text(), await self.user_markup(await self.eff_settings(), uid))
+        if rec.get("go"):
+            what = "deposit" if rec["go"] == "deposit" else "withdrawal"
+            text = (f"<b>Checking the agent…</b>\n\nConfirming the agent is online. Your {what} continues "
+                    "automatically as soon as they confirm.")
+        elif rec.get("seq"):
+            text = (f"<b>Checking…</b>\n\nAsking agent {int(rec.get('i', 0)) + 1} of {len(rec.get('q') or [])}. "
+                    "If there's no answer within 2 minutes, the next agent is asked. The answer will appear here.")
+        elif int(time.time()) - int(rec.get("t", 0)) >= PING_WAIT:
             text = ("<b>No reply yet</b>\n\nThe agent may be offline. You can still send your request; "
                     "it will wait for the agent's reply.")
         else:
@@ -1449,19 +1625,42 @@ class Bot:
         rec = await self.kv_get(f"ping:{pid}", None)
         if not isinstance(rec, dict):
             return await self.answer(q, "This check has expired.", True)
+        uid = q["from"]["id"]
         who = (q["from"].get("first_name") or "agent")[:20]
+        chat, mid = q["message"]["chat"]["id"], q["message"]["message_id"]
         if rec.get("s") != "p":
             await self.answer(q, "Already answered.", True)
-            done = "online" if rec.get("s") == "y" else "unavailable"
-            return await self.set_markup(q["message"]["chat"]["id"], q["message"]["message_id"],
-                                         {"inline_keyboard": [[{"text": f"Already answered ({done})", "callback_data": "noop"}]]})
+            done = {"y": "online", "n": "unavailable", "x": "closed"}.get(rec.get("s"), "closed")
+            return await self.set_markup(chat, mid, {"inline_keyboard": [[{"text": f"Already answered ({done})", "callback_data": "noop"}]]})
+        seq = bool(rec.get("seq"))
+        if seq:
+            qq, i = rec.get("q") or [], int(rec.get("i", 0))
+            if i >= len(qq) or str(uid) != str(qq[i]):  # the check already moved on to someone else
+                await self.answer(q, "This check moved to another agent.", True)
+                return await self.set_markup(chat, mid, {"inline_keyboard": [[{"text": "Moved to another agent", "callback_data": "noop"}]]})
+            if not yes:
+                await self.answer(q, "Okay, the next agent will be asked.")
+                await self.ping_advance(pid, rec, notify=True, label=f"Not available · by {who}")
+                return
         rec["s"] = "y" if yes else "n"
-        rec["by"] = str(q["from"]["id"])
+        rec["by"] = str(uid)
         await self.kv_set(f"ping:{pid}", rec, PING_TTL)
         await self.answer(q, "The customer was told you are online." if yes else "The customer was told you are not available.")
         label = f"✅ Online · confirmed by {who}" if yes else f"Not available · by {who}"
         for c, m in rec.get("m") or []:
             await self.set_markup(c, m, {"inline_keyboard": [[{"text": label[:60], "callback_data": "noop"}]]})
+        if seq:
+            await self.ping_idx_drop(pid)
+            st = await self.settings()
+            if st.get("alt_on") and str(uid) in self.alts and str(st.get("alt_cur") or "") != str(uid):
+                st["alt_cur"] = str(uid)  # the agent who confirmed takes the customers' requests from now on
+                await self.save_settings(st)
+            if str(uid) in self.alts:
+                self.alt_cur = str(uid)
+        if yes and str(uid) in self.alts:
+            await self.kv_set("onlok", str(uid), AUTO_FRESH)  # the next customers skip the automatic check for a while
+        if rec.get("go"):
+            return await self.online_resume(rec, "y" if yes else "n", rec.get("cm"))
         s = await self.eff_settings()
         if yes:
             text = "<b>Agent is online</b> ✅\n\nYou can send your request now."
@@ -1626,7 +1825,9 @@ class Bot:
             "<b>Deposit</b> · send the amount, your 1xBet ID, then your payment proof.",
             "<b>Withdraw</b> · send your 4-character withdraw code, then where to receive the money.",
             "<b>My request</b> · see or close your open request.",
-            "<b>Is agent online?</b> · ask the agent to confirm they are available.",
+            ("<b>Online check</b> · when you tap Deposit or Withdraw, the bot first confirms the agent is online."
+             if self.alt_on else
+             "<b>Is agent online?</b> · ask the agent to confirm they are available."),
             "<b>Support</b> · contact the admin if you have a problem.\n",
             "/start · main menu",
             "/history · my request",
@@ -1638,9 +1839,9 @@ class Bot:
         return "\n".join(lines), markup
 
     # ---------- Deposit flow: amount -> 1xBet ID (type or tap saved) -> proof ----------
-    async def ask_amount(self, chat_id, s, error=False):
+    async def ask_amount(self, chat_id, s, error=False, pre=""):
         lo, hi = s["min_dep"], s["max_dep"]
-        note = err(f"Enter a valid amount between {fmt(lo)} and {fmt(hi)} ETB.") if error else ""
+        note = pre + (err(f"Enter a valid amount between {fmt(lo)} and {fmt(hi)} ETB.") if error else "")
         text = (
             f"{head(DEP1)}\n\n{note}"
             f"Enter the amount in <b>ETB</b>.\n<i>Min {fmt(lo)} · Max {fmt(hi)}</i>\n\n"
@@ -1767,8 +1968,8 @@ class Bot:
         )
 
     # ---------- Withdraw flow: code -> method / saved account -> account ----------
-    async def ask_wit_code(self, chat_id, error=None):
-        note = err(error) if error else ""
+    async def ask_wit_code(self, chat_id, error=None, pre=""):
+        note = pre + (err(error) if error else "")
         text = (
             f"{head(WIT1)}\n\n{note}"
             "Send your <b>withdraw code</b>.\n"
@@ -2028,9 +2229,16 @@ class Bot:
             if await self.has_open_request(uid):
                 return await self.answer(q, OPEN_MSG, True)
             await self.answer(q)
+            if await self.online_needed(uid):  # Alt mode: confirm the agent is online first, then go on by itself
+                return await self.online_ask(q, go=data)
             if is_dep:
                 return await self.ask_amount(chat_id, s)
             return await self.ask_wit_code(chat_id)
+
+        # The agent didn't confirm: the customer may still go on (the request waits for the reply)
+        if data in ("ao:go:deposit", "ao:go:withdraw"):
+            await self.answer(q)
+            return await self.go_flow(uid, data[6:])
 
         # Saved 1xBet ID: one tap moves on to the payment step
         if data.startswith("sx:"):
@@ -2371,6 +2579,15 @@ class Default(WorkerEntrypoint):
             {"command": "help", "description": "How it works"},
         ]})
         return Response(f"setWebhook: {hook}\nsetMyCommands: {cmds}")
+
+    async def scheduled(self, controller, env, ctx):
+        """Cron trigger (every minute): alt-agent online checks with no answer move to the next agent."""
+        try:
+            bot = Bot(self.env)
+            await bot.load_alts()
+            await bot.ping_tick()
+        except Exception:
+            print("cron error", traceback.format_exc())
 
     async def report_error(self, update, tb):
         """Never stay silent: tell the user to retry and show the first admin what broke."""
