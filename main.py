@@ -48,11 +48,11 @@ OPEN_SHOW = 8  # open requests listed on the admin "Open requests" screen
 OPEN_MSG = "You already have a request waiting for the admin. Please wait for the reply before sending another."
 BAN_MSG = "You are not allowed to use this bot."
 PING_TTL = 900  # an online check stays answerable this long (seconds)
-PING_STEP = 120  # alt agents: no answer after this long -> the check goes to the next agent
+PING_STEP = 60  # Alt mode: no confirmation after this long -> the check is ALSO sent to the next agent (earlier cards stay valid)
+PING_EXPIRE = 180  # an agent can confirm a check for this long after getting it, then their card expires
 _PING_BUSY = set()  # online checks being moved to the next agent right now
 PING_WAIT = 180  # after this long without an answer the customer is told the agent may be offline
 PING_COOLDOWN = 60  # one online check per customer per minute (KV minimum TTL)
-AUTO_FRESH = 300  # Alt mode: an agent's "I'm online" counts for this long, so the next customers skip the automatic check
 _NAMES = {}  # agent id -> display name
 CACHE_TTL = 30  # seconds settings and the ban list are kept in memory
 _CACHE = {}  # name -> (valid until, value)
@@ -1400,11 +1400,9 @@ class Bot:
 
     # ---------- "Is agent online?" (customer asks, the agent confirms) ----------
     async def online_needed(self, uid):
-        """Alt mode: the bot confirms the agent is online when a customer taps Deposit / Withdraw.
-        Skipped for admins / agents, and while the agent in use confirmed a moment ago."""
-        if self.kv is None or not self.alt_on or not self.alts or self.is_agent(uid):
-            return False
-        return await self.kv_get("onlok", None) != str(self.alt_cur)
+        """EVERY time a customer taps Deposit / Withdraw (Alt mode on or off) the bot confirms an agent is online.
+        Skipped only for admins / agents using the bot themselves."""
+        return not (self.kv is None or not self.recipients() or self.is_agent(uid))
 
     async def go_flow(self, uid, go, pre=""):
         """Move the customer on to the first deposit / withdraw screen."""
@@ -1476,8 +1474,11 @@ class Bot:
             ask_line = "This customer asks if you are online. Tap to let them know."
         card_text = "<b>Online check</b>\n\n" + card(rows) + "\n\n" + ask_line
         # Alt mode with more than one alt agent (or an automatic check): ask ONE agent at a time, the one in use first.
-        seq = self.alt_on and (len(self.alts) > 1 or bool(go))
-        order = ([self.alt_cur] + [a for a in self.alts if a != self.alt_cur]) if seq else self.recipients()
+        seq = bool(go) or (self.alt_on and len(self.alts) > 1)
+        if self.alt_on and self.alt_cur:
+            order = [self.alt_cur] + [a for a in self.alts if a != self.alt_cur]
+        else:
+            order = list(self.recipients())  # Alt mode off: the main admins, one after another
         rec = {"pid": pid, "u": uid, "s": "p", "t": now, "m": [], "tx": card_text,
                "q": order, "i": 0, "ts": now, "seq": seq}
         if go:
@@ -1514,7 +1515,14 @@ class Bot:
         ]]}
 
     def ping_due(self, rec):
-        return bool(rec.get("seq")) and rec.get("s") == "p" and int(time.time()) - int(rec.get("ts", 0)) >= PING_STEP
+        """Alt mode: true when the check should go to the next agent (1 minute passed) or a card expired (3 minutes)."""
+        if not (rec.get("seq") and rec.get("s") == "p"):
+            return False
+        now = int(time.time())
+        if int(rec.get("i", 0)) + 1 < len(rec.get("q") or []) and now - int(rec.get("ts", 0)) >= PING_STEP:
+            return True
+        cl = [str(a) for a in rec.get("cl") or []]
+        return any(str(a) not in cl and now - int(t) >= PING_EXPIRE for a, t in (rec.get("st") or {}).items())
 
     async def ping_deliver(self, rec, start):
         """Send the check to the first reachable agent at or after position `start` of the queue.
@@ -1522,13 +1530,14 @@ class Bot:
         q = rec["q"]
         i = int(start)
         while i < len(q):
-            if str(q[i]) in self.alts:
+            if str(q[i]) in self.alts or str(q[i]) in self.admins:
                 d = as_json(await self.send(q[i], rec["tx"], self.ping_markup(rec["pid"])))
                 mid = ((d or {}).get("result") or {}).get("message_id")
                 if mid:
                     rec["i"] = i
                     rec["ts"] = int(time.time())
                     rec["m"].append([q[i], mid])
+                    rec.setdefault("st", {})[str(q[i])] = rec["ts"]  # when this agent got it (their 3 minutes start here)
                     return True
             i += 1
         rec["i"] = len(q)
@@ -1547,31 +1556,51 @@ class Bot:
             del idx[pid]
             await self.kv_set("pingidx", idx)
 
-    async def ping_advance(self, pid, rec, notify=True, label="No reply · moved to the next agent"):
-        """The agent asked didn't answer in time (or declined): close their card and ask the next one.
-        When nobody is left the customer is told (unless the caller shows that itself)."""
+    async def ping_advance(self, pid, rec, notify=True, label="Not available", declined=None):
+        """Alt mode escalation, run by the cron, by the customer's Refresh, or when an agent declines:
+        - cards older than PING_EXPIRE expire (the agent can no longer confirm);
+        - after PING_STEP (or at once if the agent declined) the check is ALSO sent to the next agent,
+          the earlier agents' cards stay valid;
+        - when everybody was asked and every card is closed, the check ends (the customer is told)."""
         if pid in _PING_BUSY:
             return rec
         _PING_BUSY.add(pid)
         try:
-            fresh = await self.kv_get(f"ping:{pid}", None)  # another run may have moved it already
-            if not isinstance(fresh, dict) or fresh.get("s") != "p" or fresh.get("i") != rec.get("i"):
+            fresh = await self.kv_get(f"ping:{pid}", None)  # another run may have changed it already
+            if not isinstance(fresh, dict) or fresh.get("s") != "p":
                 return fresh if isinstance(fresh, dict) else rec
             rec = fresh
-            if rec["m"]:
-                c, m = rec["m"][-1]
-                await self.set_markup(c, m, {"inline_keyboard": [[{"text": label[:60], "callback_data": "noop"}]]})
-            if await self.ping_deliver(rec, int(rec["i"]) + 1):
+            now = int(time.time())
+            cl = [str(a) for a in rec.get("cl") or []]
+            rec["cl"] = cl
+
+            async def close_card(aid, text):
+                for c, m in rec["m"]:
+                    if str(c) == str(aid):
+                        await self.set_markup(c, m, {"inline_keyboard": [[{"text": text[:60], "callback_data": "noop"}]]})
+
+            if declined is not None and str(declined) not in cl:
+                cl.append(str(declined))
+                await close_card(declined, label)
+            for a, t in list((rec.get("st") or {}).items()):
+                if a not in cl and now - int(t) >= PING_EXPIRE:
+                    cl.append(a)
+                    await close_card(a, "Expired · not confirmed in time")
+            more = int(rec.get("i", 0)) + 1 < len(rec.get("q") or [])
+            if more and (declined is not None or now - int(rec.get("ts", 0)) >= PING_STEP):
+                await self.ping_deliver(rec, int(rec["i"]) + 1)
+            asked_all = int(rec.get("i", 0)) + 1 >= len(rec.get("q") or [])
+            if asked_all and all(a in cl for a in (rec.get("st") or {})):
+                rec["s"] = "x"  # everybody was asked and nobody confirmed in time
                 await self.kv_set(f"ping:{pid}", rec, PING_TTL)
-                await self.ping_idx_add(pid, rec["ts"])
+                await self.ping_idx_drop(pid)
+                if rec.get("go"):  # automatic check from Deposit / Withdraw: offer to continue
+                    await self.online_resume(rec, "x", rec.get("cm"))
+                elif notify:
+                    await self.send(rec["u"], self.ping_none_text(), await self.user_markup(await self.eff_settings(), rec["u"]))
                 return rec
-            rec["s"] = "x"  # everybody was asked
             await self.kv_set(f"ping:{pid}", rec, PING_TTL)
-            await self.ping_idx_drop(pid)
-            if rec.get("go"):  # automatic check from Deposit / Withdraw: offer to continue
-                await self.online_resume(rec, "x", rec.get("cm"))
-            elif notify:
-                await self.send(rec["u"], self.ping_none_text(), await self.user_markup(await self.eff_settings(), rec["u"]))
+            await self.ping_idx_add(pid, rec.get("ts", now))
             return rec
         finally:
             _PING_BUSY.discard(pid)
@@ -1612,11 +1641,11 @@ class Bot:
             return await self.ui(chat_id, self.ping_none_text(), await self.user_markup(await self.eff_settings(), uid))
         if rec.get("go"):
             what = "deposit" if rec["go"] == "deposit" else "withdrawal"
-            text = (f"<b>Checking the agent…</b>\n\nConfirming the agent is online. Your {what} continues "
-                    "automatically as soon as they confirm.")
+            text = (f"<b>Checking the agent…</b>\n\nConfirming an agent is online. Your {what} continues "
+                    f"automatically as soon as one confirms.\n<i>Asked {len(rec.get('st') or {})} of {len(rec.get('q') or [])} agent(s).</i>")
         elif rec.get("seq"):
             text = (f"<b>Checking…</b>\n\nAsking agent {int(rec.get('i', 0)) + 1} of {len(rec.get('q') or [])}. "
-                    "If there's no answer within 2 minutes, the next agent is asked. The answer will appear here.")
+                    "If there's no answer within 1 minute, the next agent is asked too. The answer will appear here.")
         elif int(time.time()) - int(rec.get("t", 0)) >= PING_WAIT:
             text = ("<b>No reply yet</b>\n\nThe agent may be offline. You can still send your request; "
                     "it will wait for the agent's reply.")
@@ -1634,26 +1663,42 @@ class Bot:
         who = (q["from"].get("first_name") or "agent")[:20]
         chat, mid = q["message"]["chat"]["id"], q["message"]["message_id"]
         if rec.get("s") != "p":
+            if rec.get("s") == "y" and str(rec.get("by")) != str(uid):
+                await self.answer(q, "Another agent already confirmed this customer.", True)
+                return await self.set_markup(chat, mid, {"inline_keyboard": [[{"text": "Taken by another agent", "callback_data": "noop"}]]})
+            if rec.get("s") == "x":
+                await self.answer(q, "This check expired.", True)
+                return await self.set_markup(chat, mid, {"inline_keyboard": [[{"text": "Expired", "callback_data": "noop"}]]})
             await self.answer(q, "Already answered.", True)
-            done = {"y": "online", "n": "unavailable", "x": "closed"}.get(rec.get("s"), "closed")
+            done = {"y": "online", "n": "unavailable"}.get(rec.get("s"), "closed")
             return await self.set_markup(chat, mid, {"inline_keyboard": [[{"text": f"Already answered ({done})", "callback_data": "noop"}]]})
         seq = bool(rec.get("seq"))
         if seq:
-            qq, i = rec.get("q") or [], int(rec.get("i", 0))
-            if i >= len(qq) or str(uid) != str(qq[i]):  # the check already moved on to someone else
-                await self.answer(q, "This check moved to another agent.", True)
-                return await self.set_markup(chat, mid, {"inline_keyboard": [[{"text": "Moved to another agent", "callback_data": "noop"}]]})
+            sent = (rec.get("st") or {}).get(str(uid))
+            closed = [str(a) for a in rec.get("cl") or []]
+            if sent is None:  # this check was never sent to this agent
+                return await self.answer(q, "This check isn't for you.", True)
+            if str(uid) in closed or int(time.time()) - int(sent) >= PING_EXPIRE:  # their 3 minutes are over
+                await self.answer(q, "This check expired.", True)
+                return await self.set_markup(chat, mid, {"inline_keyboard": [[{"text": "Expired · not confirmed in time", "callback_data": "noop"}]]})
             if not yes:
                 await self.answer(q, "Okay, the next agent will be asked.")
-                await self.ping_advance(pid, rec, notify=True, label=f"Not available · by {who}")
+                await self.ping_advance(pid, rec, notify=True, label=f"Not available · by {who}", declined=uid)
                 return
         rec["s"] = "y" if yes else "n"
         rec["by"] = str(uid)
         await self.kv_set(f"ping:{pid}", rec, PING_TTL)
         await self.answer(q, "The customer was told you are online." if yes else "The customer was told you are not available.")
         label = f"✅ Online · confirmed by {who}" if yes else f"Not available · by {who}"
+        closed = [str(a) for a in rec.get("cl") or []]
         for c, m in rec.get("m") or []:
-            await self.set_markup(c, m, {"inline_keyboard": [[{"text": label[:60], "callback_data": "noop"}]]})
+            if yes and str(c) != str(uid):
+                await self.delete(c, m)  # someone confirmed: remove the card from every other agent
+                continue
+            if seq and str(c) in closed:
+                continue  # already shows Expired / Not available
+            lab = label if (not seq or not yes or str(c) == str(uid)) else f"Taken · confirmed by {who}"
+            await self.set_markup(c, m, {"inline_keyboard": [[{"text": lab[:60], "callback_data": "noop"}]]})
         if seq:
             await self.ping_idx_drop(pid)
             st = await self.settings()
@@ -1662,8 +1707,6 @@ class Bot:
                 await self.save_settings(st)
             if str(uid) in self.alts:
                 self.alt_cur = str(uid)
-        if yes and str(uid) in self.alts:
-            await self.kv_set("onlok", str(uid), AUTO_FRESH)  # the next customers skip the automatic check for a while
         if rec.get("go"):
             return await self.online_resume(rec, "y" if yes else "n", rec.get("cm"))
         s = await self.eff_settings()
